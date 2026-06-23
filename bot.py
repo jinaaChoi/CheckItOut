@@ -128,20 +128,24 @@ async def get_rest_exempt_dates(guild: discord.Guild, channel_name: str) -> dict
 
     exempt = {}
     try:
-        # 최근 90일치 메시지 읽기
         cutoff = datetime.now(TZ) - timedelta(days=14)
         async for msg in rest_ch.history(after=cutoff, limit=500):
             dates = parse_rest_dates(msg.content)
             if not dates:
                 continue
-            # 작성자 이름 찾기
             name = id_to_name.get(msg.author.id)
             if name is None:
-                # channel_members 미등록인 경우 display_name으로 fallback
                 name = msg.author.display_name
             if name not in exempt:
                 exempt[name] = []
             exempt[name].extend(dates)
+            # ☑️ 리액션 추가
+            already = any(str(r.emoji) == "☑️" and r.me for r in msg.reactions)
+            if not already:
+                try:
+                    await msg.add_reaction("☑️")
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
     except discord.Forbidden:
         pass
     return exempt
@@ -191,6 +195,13 @@ async def get_preupload_dates(channel: discord.TextChannel, week_dates: list) ->
                         preupload_exempt.append(future)
                         break
                     future += timedelta(days=1)
+            # ☑️ 리액션 추가
+            already = any(str(r.emoji) == "☑️" and r.me for r in msg.reactions)
+            if not already:
+                try:
+                    await msg.add_reaction("☑️")
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
     except discord.Forbidden:
         pass
 
@@ -342,8 +353,8 @@ async def calc_weekly_result(guild: discord.Guild, ref_date=None):
     이번 주 챌린지 날짜별 참여자 판정 + 리액션 추가.
 
     판정 기준:
-    - 휴식 면제일                → 🔵 휴식
-    - 선업로드 면제일             → 🔖 선업로드
+    - 휴식 면제일                → 💤 휴식
+    - 선업로드 면제일             → ✨ 선업로드
     - 당일 1장 이상              → ✅ 정상
     - 당일 0장 + 다음날 2장 이상 → ⏰ 전날 지각 + ✅ 당일 정상
     - 당일 0장 + 다음날 1장      → ❌ 전날 결석 + ✅ 당일 정상
@@ -438,7 +449,7 @@ def build_weekly_report(results: dict, week_dates: list) -> discord.Embed:
     fine_late   = cfg.get("fine_late")
     fine_absent = cfg.get("fine_absent")
     weekday_names = ["월", "화", "수", "목", "금", "토", "일"]
-    STATUS_EMOJI  = {"정상": "✅", "지각": "⏰", "결석": "❌", "휴식": "🔵", "선업로드": "🔖"}
+    STATUS_EMOJI  = {"정상": "✅", "지각": "⏰", "결석": "❌", "휴식": "💤", "선업로드": "✨"}
 
     start_str = f"{week_dates[0].month}/{week_dates[0].day}"
     end_str   = f"{week_dates[-1].month}/{week_dates[-1].day}"
@@ -854,6 +865,53 @@ async def on_ready():
     print(f"✅ 자동 출석 발표: 매일 {h:02d}:{m:02d}")
     print(f"✅ 자정 미참여 알림: 매일 00:00")
     print(f"✅ 주간 정산 자동 발표: 매주 마지막 챌린지 요일 {h:02d}:{m:02d}")
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    """
+    메시지 실시간 감지 → 즉시 리액션 추가.
+
+    - 개인 채널 + 이미지 첨부 + '미리' 키워드 → ✨ (선업로드)
+    - 개인 채널 + 이미지 첨부 (일반)           → ✅ (정상 출석)
+    - 휴식 채널 + 날짜 형식 포함               → ☑️ (휴식 신청 확인)
+    """
+    if message.author.bot:
+        return
+    if not message.guild:
+        return
+
+    prefix = cfg.get("channel_prefix")
+    rest_ch_name = cfg.get("rest_channel")
+
+    # ── 개인 채널 감지 ──
+    if message.channel.name.startswith(prefix):
+        has_image = any(
+            a.content_type and a.content_type.startswith("image/")
+            for a in message.attachments
+        )
+        if has_image:
+            # 선업로드 키워드 있으면 ✨, 없으면 ✅
+            if "미리" in (message.content or ""):
+                try:
+                    await message.add_reaction("✨")
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+            else:
+                try:
+                    await message.add_reaction("✅")
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+
+    # ── 휴식 채널 감지 ──
+    elif message.channel.name == rest_ch_name:
+        if parse_rest_dates(message.content):
+            try:
+                await message.add_reaction("☑️")
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+
+    await bot.process_commands(message)
 
 
 # =====================================================
