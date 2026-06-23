@@ -129,7 +129,7 @@ async def get_rest_exempt_dates(guild: discord.Guild, channel_name: str) -> dict
     exempt = {}
     try:
         # 최근 90일치 메시지 읽기
-        cutoff = datetime.now(TZ) - timedelta(days=90)
+        cutoff = datetime.now(TZ) - timedelta(days=14)
         async for msg in rest_ch.history(after=cutoff, limit=500):
             dates = parse_rest_dates(msg.content)
             if not dates:
@@ -162,11 +162,12 @@ async def get_preupload_dates(channel: discord.TextChannel, week_dates: list) ->
 
     if not week_dates:
         return []
-    week_start, _ = get_day_range(week_dates[0])
-    _, week_end    = get_day_range(week_dates[-1])
+
+    # 휴식 신청과 동일하게 최근 90일치 전체를 읽어서 날짜 기준으로 필터
+    cutoff = datetime.now(TZ) - timedelta(days=14)
 
     try:
-        async for msg in channel.history(after=week_start, before=week_end, limit=500):
+        async for msg in channel.history(after=cutoff, limit=500):
             has_image = any(
                 a.content_type and a.content_type.startswith("image/")
                 for a in msg.attachments
