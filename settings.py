@@ -20,6 +20,7 @@ DEFAULT_SETTINGS = {
     "weekly_channel": "",  # 주간 정산 채널 (비어있으면 attendance_channel 사용)
     "auto_report_hour": config.AUTO_REPORT_HOUR,
     "auto_report_minute": config.AUTO_REPORT_MINUTE,
+    "rest_channel": "휴식",  # 개인사정 휴식 신청 채널 이름
 }
 
 def load() -> dict:

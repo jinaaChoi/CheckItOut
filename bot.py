@@ -72,6 +72,164 @@ async def get_weekly_channel(guild: discord.Guild):
 
 
 # =====================================================
+# 휴식 신청 / 선업로드 파싱
+# =====================================================
+
+import re
+from datetime import date as date_type
+
+def parse_rest_dates(text: str) -> list:
+    """
+    #휴식 채널 메시지에서 날짜 파싱.
+    형식: [2025-06-25] 또는 [2025-06-25 ~ 2025-06-28]
+    반환: [date, date, ...] (해당 날짜들)
+    """
+    dates = []
+    # 기간 형식: [YYYY-MM-DD ~ YYYY-MM-DD]
+    range_match = re.search(r'\[(\d{4}-\d{2}-\d{2})\s*~\s*(\d{4}-\d{2}-\d{2})\]', text)
+    if range_match:
+        try:
+            start = datetime.strptime(range_match.group(1), "%Y-%m-%d").date()
+            end   = datetime.strptime(range_match.group(2), "%Y-%m-%d").date()
+            d = start
+            while d <= end:
+                dates.append(d)
+                d += timedelta(days=1)
+        except ValueError:
+            pass
+        return dates
+
+    # 단일 날짜 형식: [YYYY-MM-DD]
+    single_match = re.search(r'\[(\d{4}-\d{2}-\d{2})\]', text)
+    if single_match:
+        try:
+            dates.append(datetime.strptime(single_match.group(1), "%Y-%m-%d").date())
+        except ValueError:
+            pass
+    return dates
+
+
+async def get_rest_exempt_dates(guild: discord.Guild, channel_name: str) -> dict:
+    """
+    #휴식 채널 메시지를 읽어서 { 참여자이름: [면제날짜, ...] } 반환.
+    메시지 작성자를 channel_members로 역매핑해서 이름 찾음.
+    """
+    rest_ch = discord.utils.get(guild.text_channels, name=channel_name)
+    if rest_ch is None:
+        return {}
+
+    channel_members: dict = cfg.get("channel_members")
+    # user_id → 참여자이름 역매핑
+    id_to_name = {}
+    prefix = cfg.get("channel_prefix")
+    for ch_name, uid in channel_members.items():
+        member_name = ch_name[len(prefix):]
+        id_to_name[uid] = member_name
+
+    exempt = {}
+    try:
+        # 최근 90일치 메시지 읽기
+        cutoff = datetime.now(TZ) - timedelta(days=90)
+        async for msg in rest_ch.history(after=cutoff, limit=500):
+            dates = parse_rest_dates(msg.content)
+            if not dates:
+                continue
+            # 작성자 이름 찾기
+            name = id_to_name.get(msg.author.id)
+            if name is None:
+                # channel_members 미등록인 경우 display_name으로 fallback
+                name = msg.author.display_name
+            if name not in exempt:
+                exempt[name] = []
+            exempt[name].extend(dates)
+    except discord.Forbidden:
+        pass
+    return exempt
+
+
+async def get_preupload_dates(channel: discord.TextChannel, week_dates: list) -> list:
+    """
+    참여자 채널에서 '미리' 키워드 + 날짜 형식이 있는 이미지 메시지를 찾아
+    선업로드 면제 날짜 목록 반환.
+
+    형식:
+    - [2025-06-25] 미리 올려요        → 6/25 면제
+    - [2025-06-25 ~ 2025-06-28] 미리  → 6/25~28 면제
+    - 날짜 없이 '미리' 키워드만       → 다음 챌린지일 1일 면제 (기존 동작)
+    """
+    challenge_days = cfg.get("challenge_days")
+    preupload_exempt = []
+
+    if not week_dates:
+        return []
+    week_start, _ = get_day_range(week_dates[0])
+    _, week_end    = get_day_range(week_dates[-1])
+
+    try:
+        async for msg in channel.history(after=week_start, before=week_end, limit=500):
+            has_image = any(
+                a.content_type and a.content_type.startswith("image/")
+                for a in msg.attachments
+            )
+            if not has_image:
+                continue
+            if "미리" not in (msg.content or ""):
+                continue
+
+            # 날짜 형식이 있으면 해당 날짜들로 면제
+            parsed = parse_rest_dates(msg.content)
+            if parsed:
+                preupload_exempt.extend(parsed)
+            else:
+                # 날짜 없이 '미리'만 있으면 다음 챌린지일 1일 면제
+                msg_time = msg.created_at.astimezone(TZ)
+                msg_date = get_challenge_date(msg_time)
+                future = msg_date + timedelta(days=1)
+                for _ in range(7):
+                    if future.weekday() in challenge_days:
+                        preupload_exempt.append(future)
+                        break
+                    future += timedelta(days=1)
+    except discord.Forbidden:
+        pass
+
+    return preupload_exempt
+
+
+async def add_reaction_to_image(channel: discord.TextChannel, date, status: str):
+    """
+    해당 날짜의 이미지 메시지에 status에 맞는 리액션 추가.
+    status: '정상' → ✅, '지각' → ⏰
+    """
+    emoji_map = {"정상": "✅", "지각": "⏰"}
+    emoji = emoji_map.get(status)
+    if not emoji:
+        return
+
+    start, end = get_day_range(date)
+    try:
+        async for msg in channel.history(after=start, before=end, limit=200):
+            has_image = any(
+                a.content_type and a.content_type.startswith("image/")
+                for a in msg.attachments
+            )
+            if not has_image:
+                continue
+            # 이미 같은 리액션이 있으면 스킵
+            already = any(
+                str(r.emoji) == emoji and r.me
+                for r in msg.reactions
+            )
+            if not already:
+                try:
+                    await msg.add_reaction(emoji)
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+    except discord.Forbidden:
+        pass
+
+
+# =====================================================
 # 출석 확인
 # =====================================================
 
@@ -180,16 +338,19 @@ def build_report(date, attendance: dict, is_rest_day: bool) -> discord.Embed:
 
 async def calc_weekly_result(guild: discord.Guild):
     """
-    이번 주 챌린지 날짜별 참여자 판정.
+    이번 주 챌린지 날짜별 참여자 판정 + 리액션 추가.
 
     판정 기준:
-    - 당일 1장 이상              → 정상 ✅
-    - 당일 0장 + 다음날 2장 이상 → 전날 지각 ⏰ + 당일 정상 ✅
-    - 당일 0장 + 다음날 1장      → 전날 결석 ❌ + 당일 정상 ✅
-    - 끝까지 0장                 → 결석 ❌
+    - 휴식 면제일                → 🔵 휴식
+    - 선업로드 면제일             → 🔖 선업로드
+    - 당일 1장 이상              → ✅ 정상
+    - 당일 0장 + 다음날 2장 이상 → ⏰ 전날 지각 + ✅ 당일 정상
+    - 당일 0장 + 다음날 1장      → ❌ 전날 결석 + ✅ 당일 정상
+    - 끝까지 0장                 → ❌ 결석
     """
     today = get_challenge_date()
     challenge_days = cfg.get("challenge_days")
+    rest_channel_name = cfg.get("rest_channel")
 
     weekday = today.weekday()
     monday = today - timedelta(days=weekday)
@@ -200,18 +361,39 @@ async def calc_weekly_result(guild: discord.Guild):
         and (monday + timedelta(days=i)) <= today
     ]
 
+    # 휴식 면제 날짜 수집
+    rest_exempt = await get_rest_exempt_dates(guild, rest_channel_name)
+
     channels = get_participant_channels(guild)
     results = {}
 
     for ch in channels:
         name = get_member_name_from_channel(ch)
+
+        # 선업로드 면제 날짜
+        preupload_exempt = await get_preupload_dates(ch, week_dates)
+
+        # 날짜별 이미지 수 수집
         daily_counts = {}
         for d in week_dates:
             daily_counts[d] = await count_images(ch, d)
 
+        # 판정
         status = {}
         skip_next = False
+        member_rest_dates = rest_exempt.get(name, [])
+
         for i, d in enumerate(week_dates):
+            # 휴식 면제 먼저 체크
+            if d in member_rest_dates:
+                status[d] = "휴식"
+                continue
+
+            # 선업로드 면제
+            if d in preupload_exempt:
+                status[d] = "선업로드"
+                continue
+
             if skip_next:
                 skip_next = False
                 if d not in status:
@@ -224,17 +406,26 @@ async def calc_weekly_result(guild: discord.Guild):
             else:
                 if i + 1 < len(week_dates):
                     next_d = week_dates[i + 1]
-                    next_count = daily_counts[next_d]
-                    if next_count >= 2:
-                        status[d] = "지각"
-                        status[next_d] = "정상"
-                        skip_next = True
-                    else:
+                    # 다음날도 휴식/선업로드면 지각 판정 불가 → 결석
+                    if next_d in member_rest_dates or next_d in preupload_exempt:
                         status[d] = "결석"
+                    else:
+                        next_count = daily_counts[next_d]
+                        if next_count >= 2:
+                            status[d] = "지각"
+                            status[next_d] = "정상"
+                            skip_next = True
+                        else:
+                            status[d] = "결석"
                 else:
                     status[d] = "결석"
 
         results[name] = status
+
+        # 리액션 추가 (정상/지각 판정된 날짜)
+        for d, s in status.items():
+            if s in ("정상", "지각"):
+                await add_reaction_to_image(ch, d, s)
 
     return results, week_dates
 
@@ -246,7 +437,7 @@ def build_weekly_report(results: dict, week_dates: list) -> discord.Embed:
     fine_late   = cfg.get("fine_late")
     fine_absent = cfg.get("fine_absent")
     weekday_names = ["월", "화", "수", "목", "금", "토", "일"]
-    STATUS_EMOJI  = {"정상": "✅", "지각": "⏰", "결석": "❌"}
+    STATUS_EMOJI  = {"정상": "✅", "지각": "⏰", "결석": "❌", "휴식": "🔵", "선업로드": "🔖"}
 
     start_str = f"{week_dates[0].month}/{week_dates[0].day}"
     end_str   = f"{week_dates[-1].month}/{week_dates[-1].day}"
@@ -267,6 +458,7 @@ def build_weekly_report(results: dict, week_dates: list) -> discord.Embed:
         )
         late_count   = sum(1 for v in status.values() if v == "지각")
         absent_count = sum(1 for v in status.values() if v == "결석")
+        rest_count   = sum(1 for v in status.values() if v in ("휴식", "선업로드"))
         total_fine   = late_count * fine_late + absent_count * fine_absent
 
         summary = []
@@ -274,6 +466,8 @@ def build_weekly_report(results: dict, week_dates: list) -> discord.Embed:
             summary.append(f"지각 {late_count}회")
         if absent_count:
             summary.append(f"결석 {absent_count}회")
+        if rest_count:
+            summary.append(f"휴식/선업로드 {rest_count}회")
 
         if not summary:
             summary_str = "개근 🎉"
@@ -449,6 +643,7 @@ async def slash_config_view(interaction: discord.Interaction):
     embed = discord.Embed(title="⚙️ 현재 봇 설정", color=0x9b59b6)
     embed.add_field(name="출석 채널",      value=f"#{cfg.get('attendance_channel')}", inline=True)
     embed.add_field(name="주간 정산 채널", value=f"#{weekly_ch}" if weekly_ch else f"#{cfg.get('attendance_channel')} (동일)", inline=True)
+    embed.add_field(name="휴식 신청 채널", value=f"#{cfg.get('rest_channel')}", inline=True)
     embed.add_field(name="하루 기준 시각", value=f"{cfg.get('day_start_hour')}시", inline=True)
     embed.add_field(name="자동 발표 시각", value=f"{cfg.get('auto_report_hour'):02d}:{cfg.get('auto_report_minute'):02d}", inline=True)
     embed.add_field(name="참여일",         value=challenge_days_str, inline=True)
@@ -457,7 +652,7 @@ async def slash_config_view(interaction: discord.Interaction):
     embed.add_field(name="지각 벌금",      value=f"{cfg.get('fine_late'):,}원", inline=True)
     embed.add_field(name="결석 벌금",      value=f"{cfg.get('fine_absent'):,}원", inline=True)
     embed.add_field(name="타임존",         value=config.TIMEZONE, inline=True)
-    embed.set_footer(text="/설정변경출석채널 | /설정변경정산채널 | /설정변경발표시각 | /설정변경주제 | /설정변경기준시각 | /설정변경참여일 | /설정변경접두사 | /설정변경지각비 | /설정변경결석비")
+    embed.set_footer(text="/설정변경출석채널 | /설정변경정산채널 | /설정변경휴식채널 | /설정변경발표시각 | /설정변경주제 | /설정변경기준시각 | /설정변경참여일 | /설정변경접두사 | /설정변경지각비 | /설정변경결석비")
     await interaction.response.send_message(embed=embed)
 
 
@@ -477,6 +672,16 @@ async def slash_set_channel(interaction: discord.Interaction, 채널: discord.Te
 async def slash_set_weekly_channel(interaction: discord.Interaction, 채널: discord.TextChannel):
     cfg.set_and_save("weekly_channel", 채널.name)
     await interaction.response.send_message(f"✅ 주간 정산 채널이 {채널.mention} 으로 변경됐어요!")
+
+
+@bot.tree.command(name="설정변경휴식채널", description="개인사정 휴식 신청 채널을 변경합니다. (기본: 휴식)")
+@app_commands.describe(채널="휴식 신청 메시지를 올릴 채널")
+async def slash_set_rest_channel(interaction: discord.Interaction, 채널: discord.TextChannel):
+    cfg.set_and_save("rest_channel", 채널.name)
+    await interaction.response.send_message(
+        f"✅ 휴식 신청 채널이 {채널.mention} 으로 변경됐어요!\n"
+        f"이 채널에 `[2025-06-25]` 또는 `[2025-06-25 ~ 2025-06-28]` 형식으로 작성하면 해당 날짜 벌금이 면제돼요."
+    )
 
 
 @bot.tree.command(name="설정변경기준시각", description="하루 시작 기준 시각을 변경합니다. (이 시각 이전 업로드는 전날로 처리)")
