@@ -336,7 +336,7 @@ def build_report(date, attendance: dict, is_rest_day: bool) -> discord.Embed:
     return embed
 
 
-async def calc_weekly_result(guild: discord.Guild):
+async def calc_weekly_result(guild: discord.Guild, ref_date=None):
     """
     이번 주 챌린지 날짜별 참여자 판정 + 리액션 추가.
 
@@ -348,7 +348,7 @@ async def calc_weekly_result(guild: discord.Guild):
     - 당일 0장 + 다음날 1장      → ❌ 전날 결석 + ✅ 당일 정상
     - 끝까지 0장                 → ❌ 결석
     """
-    today = get_challenge_date()
+    today = ref_date if ref_date else get_challenge_date()
     challenge_days = cfg.get("challenge_days")
     rest_channel_name = cfg.get("rest_channel")
 
@@ -621,10 +621,18 @@ async def slash_channels(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(name="주간정산", description="이번 주 챌린지 출석/지각/결석 정산 결과를 조회합니다.")
-async def slash_weekly(interaction: discord.Interaction):
+@bot.tree.command(name="주간정산", description="이번 주(또는 특정 날짜가 속한 주)의 챌린지 정산 결과를 조회합니다.")
+@app_commands.describe(날짜="조회할 주의 날짜 (YYYY-MM-DD 형식, 생략 시 이번 주)")
+async def slash_weekly(interaction: discord.Interaction, 날짜: str = None):
     await interaction.response.defer()
-    results, week_dates = await calc_weekly_result(interaction.guild)
+    ref_date = None
+    if 날짜:
+        try:
+            ref_date = datetime.strptime(날짜, "%Y-%m-%d").date()
+        except ValueError:
+            await interaction.followup.send("❗ 날짜 형식이 올바르지 않아요. `YYYY-MM-DD` 형식으로 입력해주세요.", ephemeral=True)
+            return
+    results, week_dates = await calc_weekly_result(interaction.guild, ref_date)
     embed = build_weekly_report(results, week_dates)
     ch = await get_weekly_channel(interaction.guild)
     if ch and ch.id != interaction.channel.id:
