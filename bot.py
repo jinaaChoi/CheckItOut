@@ -151,94 +151,100 @@ async def get_rest_exempt_dates(guild: discord.Guild, channel_name: str) -> dict
     return exempt
 
 
-async def get_preupload_dates(channel: discord.TextChannel, week_dates: list) -> list:
+async def scan_channel(channel: discord.TextChannel, week_dates: list) -> dict:
     """
-    참여자 채널에서 '미리' 키워드 + 날짜 형식이 있는 이미지 메시지를 찾아
-    선업로드 면제 날짜 목록 반환.
+    채널 히스토리를 단 한 번 읽어서 아래를 모두 처리.
+    - 날짜별 일반 이미지 수 (daily_counts)
+    - 선업로드 면제 날짜 (preupload_exempt)
+    - 정상/선업로드 이모지 리액션
 
-    형식:
-    - [2025-06-25] 미리 올려요        → 6/25 면제
-    - [2025-06-25 ~ 2025-06-28] 미리  → 6/25~28 면제
-    - 날짜 없이 '미리' 키워드만       → 다음 챌린지일 1일 면제 (기존 동작)
+    반환:
+    {
+        "daily_counts": { date: int, ... },
+        "preupload_exempt": [ date, ... ],
+        "status_reactions": { date: "정상" | "선업로드", ... }  # 리액션용 캐시
+    }
     """
-    challenge_days = cfg.get("challenge_days")
-    preupload_exempt = []
-
     if not week_dates:
-        return []
+        return {"daily_counts": {}, "preupload_exempt": [], "messages_by_date": {}}
 
-    # 휴식 신청과 동일하게 최근 90일치 전체를 읽어서 날짜 기준으로 필터
+    challenge_days = cfg.get("challenge_days")
     cutoff = datetime.now(TZ) - timedelta(days=14)
 
+    # 주간 날짜 범위 (가장 이른 날 start ~ 가장 늦은 날 end)
+    _, week_end = get_day_range(week_dates[-1])
+
+    daily_counts: dict = {d: 0 for d in week_dates}
+    preupload_exempt: list = []
+    # 리액션 추가를 위해 메시지 캐싱: { date: [(msg, is_preupload), ...] }
+    messages_by_date: dict = {d: [] for d in week_dates}
+
     try:
-        async for msg in channel.history(after=cutoff, limit=500):
+        async for msg in channel.history(after=cutoff, before=week_end, limit=1000):
             has_image = any(
                 a.content_type and a.content_type.startswith("image/")
                 for a in msg.attachments
             )
             if not has_image:
                 continue
-            if "미리" not in (msg.content or ""):
-                continue
 
-            # 날짜 형식이 있으면 해당 날짜들로 면제
-            parsed = parse_rest_dates(msg.content)
-            if parsed:
-                preupload_exempt.extend(parsed)
+            msg_time = msg.created_at.astimezone(TZ)
+            msg_date = get_challenge_date(msg_time)
+            is_preupload = "미리" in (msg.content or "")
+
+            if is_preupload:
+                # 선업로드 면제 날짜 파싱
+                parsed = parse_rest_dates(msg.content)
+                if parsed:
+                    preupload_exempt.extend(parsed)
+                else:
+                    future = msg_date + timedelta(days=1)
+                    for _ in range(7):
+                        if future.weekday() in challenge_days:
+                            preupload_exempt.append(future)
+                            break
+                        future += timedelta(days=1)
+                # ✨ 리액션
+                already = any(str(r.emoji) == "✨" and r.me for r in msg.reactions)
+                if not already:
+                    try:
+                        await msg.add_reaction("✨")
+                    except (discord.Forbidden, discord.HTTPException):
+                        pass
             else:
-                # 날짜 없이 '미리'만 있으면 다음 챌린지일 1일 면제
-                msg_time = msg.created_at.astimezone(TZ)
-                msg_date = get_challenge_date(msg_time)
-                future = msg_date + timedelta(days=1)
-                for _ in range(7):
-                    if future.weekday() in challenge_days:
-                        preupload_exempt.append(future)
-                        break
-                    future += timedelta(days=1)
-            # ☑️ 리액션 추가
-            already = any(str(r.emoji) == "☑️" and r.me for r in msg.reactions)
-            if not already:
-                try:
-                    await msg.add_reaction("☑️")
-                except (discord.Forbidden, discord.HTTPException):
-                    pass
+                # 일반 이미지 → 날짜별 카운트 + 캐싱
+                if msg_date in daily_counts:
+                    daily_counts[msg_date] += 1
+                    messages_by_date[msg_date].append(msg)
+
     except discord.Forbidden:
         pass
 
-    return preupload_exempt
+    return {
+        "daily_counts": daily_counts,
+        "preupload_exempt": preupload_exempt,
+        "messages_by_date": messages_by_date,
+    }
 
 
-async def add_reaction_to_image(channel: discord.TextChannel, date, status: str):
+async def add_reactions_from_scan(messages_by_date: dict, status: dict):
     """
-    해당 날짜의 이미지 메시지에 status에 맞는 리액션 추가.
-    status: '정상' → ✅, '지각' → ⏰
+    scan_channel 결과를 바탕으로 정상/지각 리액션 추가.
+    messages_by_date: { date: [msg, ...] }
+    status: { date: "정상" | "지각" | ... }
     """
     emoji_map = {"정상": "✅", "지각": "⏰"}
-    emoji = emoji_map.get(status)
-    if not emoji:
-        return
-
-    start, end = get_day_range(date)
-    try:
-        async for msg in channel.history(after=start, before=end, limit=200):
-            has_image = any(
-                a.content_type and a.content_type.startswith("image/")
-                for a in msg.attachments
-            )
-            if not has_image:
-                continue
-            # 이미 같은 리액션이 있으면 스킵
-            already = any(
-                str(r.emoji) == emoji and r.me
-                for r in msg.reactions
-            )
+    for date, msgs in messages_by_date.items():
+        emoji = emoji_map.get(status.get(date))
+        if not emoji:
+            continue
+        for msg in msgs:
+            already = any(str(r.emoji) == emoji and r.me for r in msg.reactions)
             if not already:
                 try:
                     await msg.add_reaction(emoji)
                 except (discord.Forbidden, discord.HTTPException):
                     pass
-    except discord.Forbidden:
-        pass
 
 
 # =====================================================
@@ -246,66 +252,94 @@ async def add_reaction_to_image(channel: discord.TextChannel, date, status: str)
 # =====================================================
 
 async def check_attendance(guild: discord.Guild, date=None) -> dict:
-    """각 참여자 채널 조회 → { "진아": True/False, ... }"""
+    """
+    각 참여자 채널 조회 → { "이름": "정상" | "선업로드" | "휴식" | "미참여" }
+    """
     if date is None:
         date = get_challenge_date()
     start, end = get_day_range(date)
     channels = get_participant_channels(guild)
+    challenge_days = cfg.get("challenge_days")
+
+    # 휴식 면제 날짜 수집
+    rest_exempt = await get_rest_exempt_dates(guild, cfg.get("rest_channel"))
+
     result = {}
     for ch in channels:
         name = get_member_name_from_channel(ch)
+
+        # 휴식 면제 체크
+        if date in rest_exempt.get(name, []):
+            result[name] = "휴식"
+            continue
+
         uploaded = False
+        is_preupload = False
+        # 선업로드 면제 체크 (14일치)
+        cutoff = datetime.now(TZ) - timedelta(days=14)
         try:
+            async for msg in ch.history(after=cutoff, limit=500):
+                has_image = any(
+                    a.content_type and a.content_type.startswith("image/")
+                    for a in msg.attachments
+                )
+                if not has_image:
+                    continue
+                if "미리" in (msg.content or ""):
+                    parsed = parse_rest_dates(msg.content)
+                    exempt_dates = parsed if parsed else []
+                    if not parsed:
+                        # 날짜 없이 미리 → 다음 챌린지일 1일
+                        msg_time = msg.created_at.astimezone(TZ)
+                        msg_date = get_challenge_date(msg_time)
+                        future = msg_date + timedelta(days=1)
+                        for _ in range(7):
+                            if future.weekday() in challenge_days:
+                                exempt_dates = [future]
+                                break
+                            future += timedelta(days=1)
+                    if date in exempt_dates:
+                        is_preupload = True
+                        break
+
+            if is_preupload:
+                result[name] = "선업로드"
+                continue
+
+            # 당일 이미지 업로드 체크
             async for msg in ch.history(after=start, before=end, limit=200):
                 if any(a.content_type and a.content_type.startswith("image/") for a in msg.attachments):
                     uploaded = True
                     break
         except discord.Forbidden:
             name = f"{name}(접근불가)"
-        result[name] = uploaded
+
+        result[name] = "정상" if uploaded else "미참여"
     return result
 
 
 async def get_absent_members_with_mention(guild: discord.Guild, date=None) -> tuple:
-    """미참여자 이름 목록과 멘션 목록 반환."""
+    """미참여자 이름 목록과 멘션 목록 반환. 휴식/선업로드는 제외."""
     if date is None:
         date = get_challenge_date()
-    start, end = get_day_range(date)
-    channels = get_participant_channels(guild)
+    attendance = await check_attendance(guild, date)
     channel_members: dict = cfg.get("channel_members")
+    channels = get_participant_channels(guild)
     absent_names = []
     mentions = []
     for ch in channels:
         name = get_member_name_from_channel(ch)
-        uploaded = False
-        try:
-            async for msg in ch.history(after=start, before=end, limit=200):
-                if any(a.content_type and a.content_type.startswith("image/") for a in msg.attachments):
-                    uploaded = True
-                    break
-        except discord.Forbidden:
+        if attendance.get(name) != "미참여":
             continue
-        if not uploaded:
-            absent_names.append(name)
-            user_id = channel_members.get(ch.name)
-            if user_id:
-                mentions.append(f"<@{user_id}>")
-            else:
-                mentions.append(f"**{name}** _(미등록 — `/참여자등록`으로 멘션 연결 가능)_")
+        absent_names.append(name)
+        user_id = channel_members.get(ch.name)
+        if user_id:
+            mentions.append(f"<@{user_id}>")
+        else:
+            mentions.append(f"**{name}** _(미등록 — `/참여자등록`으로 멘션 연결 가능)_")
     return absent_names, mentions
 
 
-async def count_images(channel: discord.TextChannel, date) -> int:
-    """해당 날짜 범위 내 이미지 첨부 수 반환."""
-    start, end = get_day_range(date)
-    count = 0
-    try:
-        async for msg in channel.history(after=start, before=end, limit=200):
-            if any(a.content_type and a.content_type.startswith("image/") for a in msg.attachments):
-                count += 1
-    except discord.Forbidden:
-        pass
-    return count
 
 
 # =====================================================
@@ -325,19 +359,33 @@ def build_report(date, attendance: dict, is_rest_day: bool) -> discord.Embed:
         embed.set_footer(text=f"{cfg.get('challenge_topic')} 챌린지 봇")
         return embed
 
-    present = [name for name, ok in attendance.items() if ok]
-    absent  = [name for name, ok in attendance.items() if not ok]
-    total   = len(attendance)
-    p_count = len(present)
-    color   = 0x2ecc71 if p_count == total else (0xe67e22 if present else 0xe74c3c)
-    topic   = cfg.get("challenge_topic")
+    present   = [name for name, s in attendance.items() if s == "정상"]
+    rest      = [name for name, s in attendance.items() if s == "휴식"]
+    preupload = [name for name, s in attendance.items() if s == "선업로드"]
+    absent    = [name for name, s in attendance.items() if s == "미참여"]
+    total     = len(attendance)
+    p_count   = len(present) + len(rest) + len(preupload)
+    color     = 0x2ecc71 if not absent else (0xe67e22 if present or rest or preupload else 0xe74c3c)
+    topic     = cfg.get("challenge_topic")
 
     embed = discord.Embed(title=f"🎨 {day_str} {topic} 챌린지 출석 현황", color=color)
     embed.add_field(
-        name=f"{config.PRESENT_EMOJI} 참여 완료 ({p_count}명)",
+        name=f"{config.PRESENT_EMOJI} 참여 완료 ({len(present)}명)",
         value="\n".join(f"• {n}" for n in present) if present else "없음",
         inline=False,
     )
+    if rest:
+        embed.add_field(
+            name=f"💤 휴식 ({len(rest)}명)",
+            value="\n".join(f"• {n}" for n in rest),
+            inline=False,
+        )
+    if preupload:
+        embed.add_field(
+            name=f"✨ 선업로드 ({len(preupload)}명)",
+            value="\n".join(f"• {n}" for n in preupload),
+            inline=False,
+        )
     embed.add_field(
         name=f"{config.ABSENT_EMOJI} 미참여 ({len(absent)}명)",
         value="\n".join(f"• {n}" for n in absent) if absent else "없음",
@@ -382,13 +430,11 @@ async def calc_weekly_result(guild: discord.Guild, ref_date=None):
     for ch in channels:
         name = get_member_name_from_channel(ch)
 
-        # 선업로드 면제 날짜
-        preupload_exempt = await get_preupload_dates(ch, week_dates)
-
-        # 날짜별 이미지 수 수집
-        daily_counts = {}
-        for d in week_dates:
-            daily_counts[d] = await count_images(ch, d)
+        # 채널 히스토리 단 한 번 읽기
+        scan = await scan_channel(ch, week_dates)
+        daily_counts    = scan["daily_counts"]
+        preupload_exempt = scan["preupload_exempt"]
+        messages_by_date = scan["messages_by_date"]
 
         # 판정
         status = {}
@@ -396,16 +442,12 @@ async def calc_weekly_result(guild: discord.Guild, ref_date=None):
         member_rest_dates = rest_exempt.get(name, [])
 
         for i, d in enumerate(week_dates):
-            # 휴식 면제 먼저 체크
             if d in member_rest_dates:
                 status[d] = "휴식"
                 continue
-
-            # 선업로드 면제
             if d in preupload_exempt:
                 status[d] = "선업로드"
                 continue
-
             if skip_next:
                 skip_next = False
                 if d not in status:
@@ -418,7 +460,6 @@ async def calc_weekly_result(guild: discord.Guild, ref_date=None):
             else:
                 if i + 1 < len(week_dates):
                     next_d = week_dates[i + 1]
-                    # 다음날도 휴식/선업로드면 지각 판정 불가 → 결석
                     if next_d in member_rest_dates or next_d in preupload_exempt:
                         status[d] = "결석"
                     else:
@@ -434,10 +475,8 @@ async def calc_weekly_result(guild: discord.Guild, ref_date=None):
 
         results[name] = status
 
-        # 리액션 추가 (정상/지각 판정된 날짜)
-        for d, s in status.items():
-            if s in ("정상", "지각"):
-                await add_reaction_to_image(ch, d, s)
+        # 리액션 추가 (캐싱된 메시지 활용, 추가 API 호출 없음)
+        await add_reactions_from_scan(messages_by_date, status)
 
     return results, week_dates
 
@@ -564,10 +603,12 @@ async def midnight_reminder_task():
         day_str = f"{date.month}/{date.day}({weekday_names[date.weekday()]})"
         mention_str = " ".join(mentions)
 
+        # 멘션은 일반 텍스트로 먼저 전송해야 알림이 울림
+        await ch.send(mention_str)
+
         embed = discord.Embed(
             title=f"⏰ {day_str} 자정 미참여 알림",
             description=(
-                f"{mention_str}\n\n"
                 f"아직 오늘 {cfg.get('challenge_topic')}을(를) 업로드하지 않았어요!\n"
                 f"하루 기준 시각({cfg.get('day_start_hour')}시)까지 업로드하면 참여 인정됩니다 🖊️"
             ),
