@@ -648,6 +648,45 @@ async def slash_check(interaction: discord.Interaction, 날짜: str = None):
     await post_attendance_report(interaction.guild, date=date, interaction=interaction)
 
 
+@bot.tree.command(name="미참여알림", description="현재 미참여자에게 수동으로 알림을 보냅니다.")
+async def slash_absent_reminder(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    date = get_challenge_date()
+    if not is_challenge_day(date):
+        await interaction.followup.send("❗ 오늘은 챌린지 휴식일이에요.", ephemeral=True)
+        return
+
+    ch = await get_attendance_channel(interaction.guild)
+    if ch is None:
+        await interaction.followup.send(f"❗ `#{cfg.get('attendance_channel')}` 채널을 찾을 수 없어요.", ephemeral=True)
+        return
+
+    absent_names, mentions = await get_absent_members_with_mention(interaction.guild, date)
+    if not absent_names:
+        await interaction.followup.send("🎉 현재 미참여자가 없어요! 전원 업로드 완료!", ephemeral=True)
+        return
+
+    weekday_names = ["월", "화", "수", "목", "금", "토", "일"]
+    day_str = f"{date.month}/{date.day}({weekday_names[date.weekday()]})"
+    mention_str = " ".join(mentions)
+
+    await ch.send(mention_str)
+
+    embed = discord.Embed(
+        title=f"⏰ {day_str} 미참여 알림",
+        description=(
+            f"아직 오늘 {cfg.get('challenge_topic')}을(를) 업로드하지 않았어요!\n"
+            f"하루 기준 시각({cfg.get('day_start_hour')}시)까지 업로드하면 참여 인정됩니다 🖊️"
+        ),
+        color=0xe74c3c,
+    )
+    embed.set_footer(text=f"{cfg.get('challenge_topic')} 챌린지 봇 • 수동 알림")
+    embed.timestamp = datetime.now(TZ)
+    await ch.send(embed=embed)
+    await interaction.followup.send(f"✅ {ch.mention} 에 미참여 알림을 보냈어요! ({len(absent_names)}명)", ephemeral=True)
+
+
 @bot.tree.command(name="채널목록", description="현재 감지된 참여자 채널 목록을 보여줍니다.")
 async def slash_channels(interaction: discord.Interaction):
     channels = get_participant_channels(interaction.guild)
