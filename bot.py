@@ -139,13 +139,7 @@ async def get_rest_exempt_dates(guild: discord.Guild, channel_name: str) -> dict
             if name not in exempt:
                 exempt[name] = []
             exempt[name].extend(dates)
-            # ☑️ 리액션 추가
-            already = any(str(r.emoji) == "☑️" and r.me for r in msg.reactions)
-            if not already:
-                try:
-                    await msg.add_reaction("☑️")
-                except (discord.Forbidden, discord.HTTPException):
-                    pass
+            # ☑️ 리액션은 on_message에서 실시간으로 처리하므로 여기선 생략
     except discord.Forbidden:
         pass
     return exempt
@@ -204,13 +198,7 @@ async def scan_channel(channel: discord.TextChannel, week_dates: list) -> dict:
                             preupload_exempt.append(future)
                             break
                         future += timedelta(days=1)
-                # ✨ 리액션
-                already = any(str(r.emoji) == "✨" and r.me for r in msg.reactions)
-                if not already:
-                    try:
-                        await msg.add_reaction("✨")
-                    except (discord.Forbidden, discord.HTTPException):
-                        pass
+                # ✨ 리액션은 on_message에서 실시간으로 처리하므로 여기선 생략
             else:
                 # 일반 이미지 → 날짜별 카운트 + 캐싱
                 if msg_date in daily_counts:
