@@ -245,12 +245,11 @@ async def add_reactions_from_scan(messages_by_date: dict, status: dict):
 async def check_attendance(guild: discord.Guild, date=None) -> dict:
     """
     각 참여자 채널 조회 → { "이름": "정상" | "선업로드" | "휴식" | "미참여" }
+    scan_channel을 활용해서 채널당 히스토리 1번만 읽음.
     """
     if date is None:
         date = get_challenge_date()
-    start, end = get_day_range(date)
     channels = get_participant_channels(guild)
-    challenge_days = cfg.get("challenge_days")
 
     # 휴식 면제 날짜 수집
     rest_exempt = await get_rest_exempt_dates(guild, cfg.get("rest_channel"))
@@ -264,48 +263,18 @@ async def check_attendance(guild: discord.Guild, date=None) -> dict:
             result[name] = "휴식"
             continue
 
-        uploaded = False
-        is_preupload = False
-        # 선업로드 면제 체크 (14일치)
-        cutoff = datetime.now(TZ) - timedelta(days=14)
-        try:
-            async for msg in ch.history(after=cutoff, limit=500):
-                has_image = any(
-                    a.content_type and a.content_type.startswith("image/")
-                    for a in msg.attachments
-                )
-                if not has_image:
-                    continue
-                if "미리" in (msg.content or ""):
-                    parsed = parse_rest_dates(msg.content)
-                    exempt_dates = parsed if parsed else []
-                    if not parsed:
-                        # 날짜 없이 미리 → 다음 챌린지일 1일
-                        msg_time = msg.created_at.astimezone(TZ)
-                        msg_date = get_challenge_date(msg_time)
-                        future = msg_date + timedelta(days=1)
-                        for _ in range(7):
-                            if future.weekday() in challenge_days:
-                                exempt_dates = [future]
-                                break
-                            future += timedelta(days=1)
-                    if date in exempt_dates:
-                        is_preupload = True
-                        break
+        # scan_channel로 한 번에 처리
+        scan = await scan_channel(ch, [date])
+        daily_counts     = scan["daily_counts"]
+        preupload_exempt = scan["preupload_exempt"]
 
-            if is_preupload:
-                result[name] = "선업로드"
-                continue
+        if date in preupload_exempt:
+            result[name] = "선업로드"
+        elif daily_counts.get(date, 0) >= 1:
+            result[name] = "정상"
+        else:
+            result[name] = "미참여"
 
-            # 당일 이미지 업로드 체크
-            async for msg in ch.history(after=start, before=end, limit=200):
-                if any(a.content_type and a.content_type.startswith("image/") for a in msg.attachments):
-                    uploaded = True
-                    break
-        except discord.Forbidden:
-            name = f"{name}(접근불가)"
-
-        result[name] = "정상" if uploaded else "미참여"
     return result
 
 
