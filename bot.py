@@ -206,7 +206,8 @@ async def scan_channel(channel: discord.TextChannel, week_dates: list) -> dict:
                 # 일반 이미지 → 날짜별 카운트 + 캐싱
                 if msg_date in daily_counts:
                     daily_counts[msg_date] += 1
-                    messages_by_date[msg_date].append(msg)
+                    if msg_date in messages_by_date:  # 챌린지일만 리액션 캐싱
+                        messages_by_date[msg_date].append(msg)
 
     except discord.Forbidden:
         pass
@@ -860,6 +861,38 @@ async def slash_register(interaction: discord.Interaction, 채널: discord.TextC
     channel_members[채널.name] = 멤버.id
     cfg.set_and_save("channel_members", channel_members)
     await interaction.response.send_message(f"✅ **#{채널.name}** → {멤버.mention} 연결 완료!\n이제 자정 알림에서 정확히 멘션돼요.")
+
+
+@bot.tree.command(name="참여자일괄등록", description="접두사로 시작하는 채널을 스캔해서 닉네임이 일치하는 멤버를 자동으로 연결합니다.")
+async def slash_register_all(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    channels = get_participant_channels(interaction.guild)
+    channel_members: dict = cfg.get("channel_members")
+    success_lines = []
+    fail_lines = []
+
+    for ch in channels:
+        member_name = get_member_name_from_channel(ch)
+        member = discord.utils.find(
+            lambda m: m.display_name == member_name or m.name == member_name,
+            interaction.guild.members
+        )
+        if member:
+            channel_members[ch.name] = member.id
+            success_lines.append(f"✅ #{ch.name} → {member.mention}")
+        else:
+            fail_lines.append(f"❌ #{ch.name}")
+
+    cfg.set_and_save("channel_members", channel_members)
+
+    embed = discord.Embed(title="👥 참여자 일괄 등록 결과", color=0x2ecc71 if not fail_lines else 0xe67e22)
+    if success_lines:
+        embed.add_field(name=f"✅ 자동 등록 ({len(success_lines)}명)", value="\n".join(success_lines), inline=False)
+    if fail_lines:
+        embed.add_field(name=f"❌ 매핑 실패 ({len(fail_lines)}명)", value="\n".join(fail_lines) + "\n\n`/참여자등록` 으로 직접 연결해주세요.", inline=False)
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="참여자해제", description="채널-멤버 연결을 해제합니다.")
