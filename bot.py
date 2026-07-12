@@ -165,16 +165,19 @@ async def scan_channel(channel: discord.TextChannel, week_dates: list) -> dict:
     challenge_days = cfg.get("challenge_days")
     cutoff = datetime.now(TZ) - timedelta(days=14)
 
-    # 주간 날짜 범위 (가장 이른 날 start ~ 가장 늦은 날 end)
-    _, week_end = get_day_range(week_dates[-1])
+    # 마지막 챌린지일 다음날(토/일 포함)까지 범위 확장 (금요일 지각 감지용)
+    last_challenge_date = week_dates[-1]
+    next_day = last_challenge_date + timedelta(days=1)
+    _, scan_end = get_day_range(next_day)
 
-    daily_counts: dict = {d: 0 for d in week_dates}
+    # 챌린지일 + 다음날까지 카운트 (지각 판정용)
+    all_scan_dates = list(week_dates) + [next_day]
+    daily_counts: dict = {d: 0 for d in all_scan_dates}
     preupload_exempt: list = []
-    # 리액션 추가를 위해 메시지 캐싱: { date: [(msg, is_preupload), ...] }
-    messages_by_date: dict = {d: [] for d in week_dates}
+    messages_by_date: dict = {d: [] for d in week_dates}  # 리액션은 챌린지일만
 
     try:
-        async for msg in channel.history(after=cutoff, before=week_end, limit=1000):
+        async for msg in channel.history(after=cutoff, before=scan_end, limit=1000):
             has_image = any(
                 a.content_type and a.content_type.startswith("image/")
                 for a in msg.attachments
@@ -389,12 +392,13 @@ async def calc_weekly_result(guild: discord.Guild, ref_date=None):
     이번 주 챌린지 날짜별 참여자 판정 + 리액션 추가.
 
     판정 기준:
-    - 휴식 면제일                → 💤 휴식
-    - 선업로드 면제일             → ✨ 선업로드
-    - 당일 1장 이상              → ✅ 정상
-    - 당일 0장 + 다음날 2장 이상 → ⏰ 전날 지각 + ✅ 당일 정상
-    - 당일 0장 + 다음날 1장      → ❌ 전날 결석 + ✅ 당일 정상
-    - 끝까지 0장                 → ❌ 결석
+    - 휴식 면제일                      → 💤 휴식
+    - 선업로드 면제일                   → ✨ 선업로드
+    - 당일 1장 이상                    → ✅ 정상
+    - 당일 0장 + 다음날 1장            → ⏰ 전날 지각
+    - 당일 0장 + 다음날 2장 이상       → ⏰ 전날 지각 + ✅ 당일 정상
+    - 끝까지 0장                       → ❌ 결석
+    (다음날은 휴식일 포함, 금요일이면 토요일 업로드도 확인)
     """
     today = ref_date if ref_date else get_challenge_date()
     challenge_days = cfg.get("challenge_days")
@@ -446,20 +450,26 @@ async def calc_weekly_result(guild: discord.Guild, ref_date=None):
             if count >= 1:
                 status[d] = "정상"
             else:
+                # 다음날 확인 (챌린지일이면 week_dates 기준, 아니면 next_day)
                 if i + 1 < len(week_dates):
                     next_d = week_dates[i + 1]
-                    if next_d in member_rest_dates or next_d in preupload_exempt:
-                        status[d] = "결석"
-                    else:
-                        next_count = daily_counts[next_d]
-                        if next_count >= 2:
-                            status[d] = "지각"
+                else:
+                    # 마지막 챌린지일 → 다음날(토/일 포함) 확인
+                    next_d = d + timedelta(days=1)
+
+                if next_d in member_rest_dates or next_d in preupload_exempt:
+                    status[d] = "결석"
+                else:
+                    next_count = daily_counts.get(next_d, 0)
+                    if next_count >= 1:
+                        # 1장 → 전날 지각
+                        # 2장 이상 → 전날 지각 + 당일 정상 (챌린지일인 경우만)
+                        status[d] = "지각"
+                        if next_count >= 2 and i + 1 < len(week_dates):
                             status[next_d] = "정상"
                             skip_next = True
-                        else:
-                            status[d] = "결석"
-                else:
-                    status[d] = "결석"
+                    else:
+                        status[d] = "결석"
 
         results[name] = status
 
