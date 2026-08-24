@@ -51,7 +51,10 @@ def get_day_range(date):
 
 def get_participant_channels(guild: discord.Guild) -> list:
     prefix = cfg.get("channel_prefix")
-    return [ch for ch in guild.text_channels if ch.name.startswith(prefix)]
+    return [
+        ch for ch in guild.text_channels
+        if ch.name.startswith(prefix) and ch.permissions_for(guild.me).view_channel
+    ]
 
 
 def get_member_name_from_channel(channel: discord.TextChannel) -> str:
