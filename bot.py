@@ -1005,7 +1005,7 @@ async def slash_config_view(interaction: discord.Interaction):
     embed.add_field(name="타임존",         value=config.TIMEZONE, inline=True)
     embed.set_footer(text=(
         "/설정변경출석채널 | /설정변경정산채널 | /설정변경벌금채널 | /설정변경휴식채널 | /설정변경발표시각 | /설정변경주제 | /설정변경기준시각 | /설정변경참여일 | /설정변경접두사 | /설정변경지각비 | /설정변경결석비\n"
-        "💸 /벌금현황 /벌금납부 /벌금내역 /벌금수정 /벌금취소 /벌금정산 | ✏️ /출석수정 /출석수정취소"
+        "💸 /벌금현황 /벌금납부 /벌금내역 /벌금수정 /벌금수정취소 /벌금취소 /벌금정산 | ✏️ /출석수정 /출석수정취소"
     ))
     await interaction.response.send_message(embed=embed)
 
@@ -1320,6 +1320,7 @@ async def slash_fine_history(interaction: discord.Interaction, 멤버: discord.M
         lines.append("")
         lines.append(f"**미납 {unpaid_total:,}원 / 누적 납부 {paid_total:,}원 / 총 발생 {total:,}원**")
         embed = discord.Embed(title=f"💸 {name} 벌금 내역", description="\n".join(lines), color=0x3498db)
+        embed.set_footer(text="✅ 납부는 /벌금취소 · (수정됨)은 /벌금수정취소 로 되돌릴 수 있어요")
     else:
         # 전원 요약
         per_member = {}  # 이름 → [미납, 납부]
@@ -1410,8 +1411,94 @@ async def slash_fine_edit(interaction: discord.Interaction, 멤버: discord.Memb
     embed.add_field(name="금액", value=f"{old_amount:,}원 → **{금액:,}원**", inline=True)
     if 사유:
         embed.add_field(name="사유", value=사유, inline=False)
-    embed.set_footer(text="수정된 주는 정산 재계산 때 금액이 덮어써지지 않아요")
+    embed.set_footer(text="수정된 주는 정산 재계산 때 금액이 덮어써지지 않아요 (/벌금수정취소 로 되돌릴 수 있어요)")
     await interaction.response.send_message(embed=embed)
+
+
+async def _judge_member_week_now(guild: discord.Guild, name: str, monday):
+    """
+    해당 참여자의 특정 주 판정을 지금 기준으로 다시 계산.
+    참여자 채널을 못 찾으면 None 반환.
+    """
+    channel = discord.utils.get(guild.text_channels, name=cfg.get("channel_prefix") + name)
+    if channel is None:
+        return None
+
+    today = get_challenge_date()
+    ref = min(today, monday + timedelta(days=6))
+    week_dates = get_week_dates(ref)
+    if not week_dates:
+        return {}
+
+    rest_exempt = await get_rest_exempt_dates(guild, cfg.get("rest_channel"), week_dates[0])
+    scan = await scan_channel(channel, week_dates)
+    judge_counts = build_judge_counts(scan["daily_counts"], name)
+
+    overrides = {}
+    for d in week_dates:
+        ov = store.get_override(d, name)
+        if ov is not None:
+            overrides[d] = ov
+
+    return judge_member_week(
+        week_dates, judge_counts, rest_exempt.get(name, []), scan["preupload_exempt"], overrides
+    )
+
+
+@bot.tree.command(name="벌금수정취소", description="수동으로 수정한 벌금을 취소하고 자동 계산으로 되돌립니다.")
+@app_commands.describe(멤버="수정을 취소할 참여자", 주차="해당 주의 날짜 (YYYY-MM-DD, 그 주 아무 날짜나 가능)")
+async def slash_fine_edit_cancel(interaction: discord.Interaction, 멤버: discord.Member, 주차: str):
+    name = get_participant_name(멤버)
+    if name is None:
+        await interaction.response.send_message(UNREGISTERED_MSG.format(name=멤버.display_name), ephemeral=True)
+        return
+    monday = _parse_week_key(주차)
+    if monday is None:
+        await interaction.response.send_message(DATE_FORMAT_MSG, ephemeral=True)
+        return
+
+    rec = store.get_member_fine(monday, name)
+    label = format_week_label(monday)
+    if rec is None:
+        await interaction.response.send_message(f"❗ **{name}** 님은 {label}에 벌금 기록이 없어요.", ephemeral=True)
+        return
+    if not rec.get("edited"):
+        await interaction.response.send_message(
+            f"❗ **{name}** 님의 {label} 벌금은 수동 수정된 기록이 아니에요. 되돌릴 게 없어요.", ephemeral=True
+        )
+        return
+    if rec.get("paid"):
+        await interaction.response.send_message(
+            f"❗ **{name}** 님의 {label} 벌금은 이미 납부 완료 상태예요.\n"
+            f"`/벌금취소` 로 납부를 먼저 되돌린 뒤에 다시 시도해주세요. "
+            f"(이미 받은 돈이 재계산으로 바뀌면 안 되니까요)",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer()
+
+    status = await _judge_member_week_now(interaction.guild, name, monday)
+    if status is None:
+        await interaction.followup.send(f"❗ **{name}** 님의 참여자 채널을 찾을 수 없어요.", ephemeral=True)
+        return
+
+    old_amount = rec.get("amount", 0)
+    old_reason = rec.get("edit_reason")
+    late, absent, new_amount = count_fine_from_status(status)
+    # edited/paid가 모두 False인 새 레코드로 교체 → 다시 자동 계산 대상이 돼요
+    store.set_member_fine(monday, name, _make_fine_record(late, absent, new_amount))
+
+    embed = discord.Embed(title="↩️ 벌금 수정 취소 완료", color=0x2ecc71)
+    embed.add_field(name="멤버", value=name, inline=True)
+    embed.add_field(name="주차", value=label, inline=True)
+    embed.add_field(name="금액", value=f"{old_amount:,}원 → **{new_amount:,}원**", inline=True)
+    if old_reason:
+        embed.add_field(name="취소된 수정 사유", value=old_reason, inline=False)
+    embed.add_field(name="자동 판정", value=f"지각 {late}회 / 결석 {absent}회", inline=False)
+    embed.set_footer(text="이 주는 다시 자동 계산 대상이에요 — /출석수정 하면 금액에 바로 반영돼요")
+    embed.timestamp = datetime.now(TZ)
+    await interaction.followup.send(embed=embed)
 
 
 @bot.tree.command(name="벌금정산", description="지난 주의 벌금을 수동으로 정산해 원장에 기록합니다. (기능 도입 전 과거 주 백필용)")
