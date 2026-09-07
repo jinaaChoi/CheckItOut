@@ -2,3 +2,9 @@
 settings.json
 __pycache__/
 *.pyc
+
+# 런타임 데이터 (배포 서버별로 따로 관리)
+attendance_log.json
+fines.json
+overrides.json
+meta.json

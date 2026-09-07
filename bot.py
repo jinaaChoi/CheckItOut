@@ -7,6 +7,7 @@ import os
 from dotenv import load_dotenv
 import config
 import settings as cfg
+import store
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -74,6 +75,47 @@ async def get_weekly_channel(guild: discord.Guild):
     return await get_attendance_channel(guild)
 
 
+async def get_fine_channel(guild: discord.Guild):
+    """벌금 현황 채널 반환. 미설정이거나 채널이 없으면 주간 정산 채널 사용."""
+    fine_ch_name = cfg.get("fine_channel")
+    if fine_ch_name:
+        ch = discord.utils.get(guild.text_channels, name=fine_ch_name)
+        if ch is not None:
+            return ch
+    return await get_weekly_channel(guild)
+
+
+def get_participant_name(member: discord.Member):
+    """discord.Member → 참여자 이름 (channel_members 역매핑). 미등록이면 None."""
+    prefix = cfg.get("channel_prefix")
+    channel_members: dict = cfg.get("channel_members")
+    for ch_name, uid in channel_members.items():
+        if uid == member.id:
+            return ch_name[len(prefix):]
+    return None
+
+
+def get_week_dates(ref_date) -> list:
+    """ref_date가 속한 주의 챌린지 날짜 목록 (ref_date 이하만)."""
+    challenge_days = cfg.get("challenge_days")
+    monday = ref_date - timedelta(days=ref_date.weekday())
+    return [
+        monday + timedelta(days=i)
+        for i in range(7)
+        if (monday + timedelta(days=i)).weekday() in challenge_days
+        and (monday + timedelta(days=i)) <= ref_date
+    ]
+
+
+def format_week_label(week_key) -> str:
+    """'YYYY-MM-DD'(월요일) 또는 date → 'M/D 주' 라벨."""
+    try:
+        d = week_key if isinstance(week_key, date_type) else datetime.strptime(week_key, "%Y-%m-%d").date()
+        return f"{d.month}/{d.day} 주"
+    except (ValueError, TypeError):
+        return str(week_key)
+
+
 # =====================================================
 # 휴식 신청 / 선업로드 파싱
 # =====================================================
@@ -112,10 +154,11 @@ def parse_rest_dates(text: str) -> list:
     return dates
 
 
-async def get_rest_exempt_dates(guild: discord.Guild, channel_name: str) -> dict:
+async def get_rest_exempt_dates(guild: discord.Guild, channel_name: str, ref_date=None) -> dict:
     """
     #휴식 채널 메시지를 읽어서 { 참여자이름: [면제날짜, ...] } 반환.
     메시지 작성자를 channel_members로 역매핑해서 이름 찾음.
+    ref_date: 조회 기준 날짜 — 이 날짜 기준 한 달 전부터 읽어요 (과거 주 조회 지원).
     """
     rest_ch = discord.utils.get(guild.text_channels, name=channel_name)
     if rest_ch is None:
@@ -131,8 +174,11 @@ async def get_rest_exempt_dates(guild: discord.Guild, channel_name: str) -> dict
 
     exempt = {}
     try:
-        cutoff = datetime.now(TZ) - timedelta(days=14)
-        async for msg in rest_ch.history(after=cutoff, limit=500):
+        if ref_date is None:
+            ref_date = get_challenge_date()
+        base = TZ.localize(datetime(ref_date.year, ref_date.month, ref_date.day))
+        cutoff = min(base, datetime.now(TZ)) - timedelta(days=30)
+        async for msg in rest_ch.history(after=cutoff, limit=1000):
             dates = parse_rest_dates(msg.content)
             if not dates:
                 continue
@@ -166,13 +212,15 @@ async def scan_channel(channel: discord.TextChannel, week_dates: list) -> dict:
         return {"daily_counts": {}, "preupload_exempt": [], "messages_by_date": {}}
 
     challenge_days = cfg.get("challenge_days")
-    cutoff = datetime.now(TZ) - timedelta(days=14)
 
     # 스캔 범위: 첫 챌린지일 ~ 마지막 챌린지일 다음날까지
     # (중간 비챌린지일 + 마지막 다음날 지각 감지 포함)
     last_challenge_date = week_dates[-1]
     next_day = last_challenge_date + timedelta(days=1)
     _, scan_end = get_day_range(next_day)
+
+    # 조회 대상 날짜 기준으로 최근 한 달치를 읽어요 (과거 주 조회 지원)
+    cutoff = scan_end - timedelta(days=30)
 
     # 카운트 대상: 챌린지일 + 각 챌린지일 바로 다음 캘린더 날짜(비챌린지일인 경우)
     scan_dates = set(week_dates)
@@ -186,7 +234,7 @@ async def scan_channel(channel: discord.TextChannel, week_dates: list) -> dict:
     messages_by_date: dict = {d: [] for d in week_dates}  # 리액션은 챌린지일만
 
     try:
-        async for msg in channel.history(after=cutoff, before=scan_end, limit=1000):
+        async for msg in channel.history(after=cutoff, before=scan_end, limit=2000):
             has_image = any(
                 a.content_type and a.content_type.startswith("image/")
                 for a in msg.attachments
@@ -262,7 +310,7 @@ async def check_attendance(guild: discord.Guild, date=None) -> dict:
     channels = get_participant_channels(guild)
 
     # 휴식 면제 날짜 수집
-    rest_exempt = await get_rest_exempt_dates(guild, cfg.get("rest_channel"))
+    rest_exempt = await get_rest_exempt_dates(guild, cfg.get("rest_channel"), date)
 
     result = {}
     for ch in channels:
@@ -310,6 +358,30 @@ async def get_absent_members_with_mention(guild: discord.Guild, date=None) -> tu
     return absent_names, mentions
 
 
+# =====================================================
+# 일일 스냅샷 기록
+# =====================================================
+
+async def record_daily_snapshot(guild: discord.Guild, date):
+    """
+    해당 날짜의 참여자별 업로드 기록을 attendance_log.json에 저장.
+    이미 기록된 날짜는 절대 다시 쓰지 않아요 (기록 동결 —
+    나중에 이미지를 지웠다 다시 올려도 과거 판정이 바뀌지 않도록).
+    """
+    if store.has_snapshot(date):
+        return
+
+    rest_exempt = await get_rest_exempt_dates(guild, cfg.get("rest_channel"), date)
+    snapshot = {}
+    for ch in get_participant_channels(guild):
+        name = get_member_name_from_channel(ch)
+        scan = await scan_channel(ch, [date])
+        snapshot[name] = {
+            "count": scan["daily_counts"].get(date, 0),
+            "preupload": date in scan["preupload_exempt"],
+            "rest": date in rest_exempt.get(name, []),
+        }
+    store.save_snapshot(date, snapshot)
 
 
 # =====================================================
@@ -366,34 +438,127 @@ def build_report(date, attendance: dict, is_rest_day: bool) -> discord.Embed:
     return embed
 
 
-async def calc_weekly_result(guild: discord.Guild, ref_date=None):
+def judge_member_week(week_dates: list, judge_counts: dict, member_rest_dates: list,
+                      preupload_exempt: list, overrides: dict = None) -> dict:
     """
-    이번 주 챌린지 날짜별 참여자 판정 + 리액션 추가.
+    한 참여자의 주간 판정 로직. { date: 상태 } 반환.
+
+    judge_counts: { date: 장수 } — 스냅샷 우선 값 (없으면 라이브 스캔 값)
+    overrides:    { date: 상태 } — /출석수정 수동 보정 (다른 모든 판정보다 우선)
 
     판정 기준:
+    - 수동 보정                        → 해당 상태 그대로
     - 휴식 면제일                      → 💤 휴식
     - 선업로드 면제일                   → ✨ 선업로드
     - 당일 1장 이상                    → ✅ 정상
     - 당일 0장 + 다음날 1장            → ⏰ 전날 지각
     - 당일 0장 + 다음날 2장 이상       → ⏰ 전날 지각 + ✅ 당일 정상
+    - 당일 0장 + 다음날이 휴식/선업로드 면제일인데 1장 이상 → ⏰ 전날 지각
+      (휴식일엔 올릴 의무가 없으니 1장이면 충분해요)
     - 끝까지 0장                       → ❌ 결석
-    (다음날은 휴식일 포함, 금요일이면 토요일 업로드도 확인)
+    (다음날은 휴식일 포함, 금요일이면 토요일 업로드도 확인.
+     지각 인정은 딱 하루 전까지만 — 몰아서 올려도 여러 날이 살아나진 않아요.)
+    """
+    challenge_days = cfg.get("challenge_days")
+    if overrides is None:
+        overrides = {}
+
+    status = {}
+    skip_next = False
+
+    for i, d in enumerate(week_dates):
+        if d in overrides:
+            # 수동 보정 최우선
+            status[d] = overrides[d]
+            skip_next = False
+            continue
+        if d in member_rest_dates:
+            status[d] = "휴식"
+            continue
+        if d in preupload_exempt:
+            status[d] = "선업로드"
+            continue
+        if skip_next:
+            skip_next = False
+            if d not in status:
+                status[d] = "정상" if judge_counts.get(d, 0) >= 1 else "결석"
+            continue
+
+        count = judge_counts.get(d, 0)
+        if count >= 1:
+            status[d] = "정상"
+        else:
+            if i + 1 < len(week_dates):
+                next_challenge_d = week_dates[i + 1]
+                next_calendar_d = d + timedelta(days=1)
+
+                if next_challenge_d in member_rest_dates or next_challenge_d in preupload_exempt:
+                    # 다음 챌린지일이 휴식/선업로드 면제일이어도
+                    # 그날 1장 이상 올렸으면 전날 지각으로 인정해요
+                    next_count = judge_counts.get(next_challenge_d, 0)
+                    status[d] = "지각" if next_count >= 1 else "결석"
+                elif next_calendar_d != next_challenge_d and next_calendar_d.weekday() not in challenge_days:
+                    # 바로 다음 캘린더 날짜가 챌린지일이 아닌 경우 (예: 화→수 비챌린지)
+                    # 그 날 1장 이상 올리면 지각, 없으면 다음 챌린지일 장수로 판단
+                    next_cal_count = judge_counts.get(next_calendar_d, 0)
+                    if next_cal_count >= 1:
+                        status[d] = "지각"
+                    else:
+                        next_count = judge_counts.get(next_challenge_d, 0)
+                        if next_count >= 2:
+                            status[d] = "지각"
+                            status[next_challenge_d] = "정상"
+                            skip_next = True
+                        else:
+                            status[d] = "결석"
+                else:
+                    # 바로 다음 캘린더 날짜가 다음 챌린지일인 경우 (예: 월→화)
+                    next_count = judge_counts.get(next_challenge_d, 0)
+                    if next_count >= 2:
+                        status[d] = "지각"
+                        status[next_challenge_d] = "정상"
+                        skip_next = True
+                    else:
+                        status[d] = "결석"
+            else:
+                # 마지막 챌린지일: 바로 다음 캘린더 날짜가 챌린지일이 아니면 지각 인정
+                next_calendar_day = d + timedelta(days=1)
+                if next_calendar_day.weekday() not in challenge_days:
+                    next_count = judge_counts.get(next_calendar_day, 0)
+                    status[d] = "지각" if next_count >= 1 else "결석"
+                else:
+                    status[d] = "결석"
+
+    return status
+
+
+def build_judge_counts(daily_counts: dict, name: str) -> dict:
+    """
+    판정에 사용할 날짜별 장수 계산.
+    스냅샷(attendance_log.json)이 있는 날짜는 스냅샷 값을 우선 사용 —
+    과거 이미지를 지웠다 다시 올려도 판정이 바뀌지 않아요.
+    """
+    judge_counts = {}
+    for d, live_count in daily_counts.items():
+        snap = store.get_member_snapshot(d, name)
+        judge_counts[d] = snap["count"] if snap is not None else live_count
+    return judge_counts
+
+
+async def calc_weekly_result(guild: discord.Guild, ref_date=None):
+    """
+    이번 주(또는 ref_date가 속한 주) 챌린지 날짜별 참여자 판정 + 리액션 추가.
+    판정 장수는 일일 스냅샷 우선, 휴식/선업로드 면제는 항상 라이브로 읽어요.
     """
     today = ref_date if ref_date else get_challenge_date()
-    challenge_days = cfg.get("challenge_days")
     rest_channel_name = cfg.get("rest_channel")
 
-    weekday = today.weekday()
-    monday = today - timedelta(days=weekday)
-    week_dates = [
-        monday + timedelta(days=i)
-        for i in range(7)
-        if (monday + timedelta(days=i)).weekday() in challenge_days
-        and (monday + timedelta(days=i)) <= today
-    ]
+    week_dates = get_week_dates(today)
 
-    # 휴식 면제 날짜 수집
-    rest_exempt = await get_rest_exempt_dates(guild, rest_channel_name)
+    # 휴식 면제 날짜 수집 (조회 주 기준)
+    rest_exempt = await get_rest_exempt_dates(
+        guild, rest_channel_name, week_dates[0] if week_dates else today
+    )
 
     channels = get_participant_channels(guild)
     results = {}
@@ -403,69 +568,19 @@ async def calc_weekly_result(guild: discord.Guild, ref_date=None):
 
         # 채널 히스토리 단 한 번 읽기
         scan = await scan_channel(ch, week_dates)
-        daily_counts    = scan["daily_counts"]
+        daily_counts     = scan["daily_counts"]
         preupload_exempt = scan["preupload_exempt"]
         messages_by_date = scan["messages_by_date"]
 
-        # 판정
-        status = {}
-        skip_next = False
+        # 판정 (스냅샷 우선 장수 + 수동 보정 반영)
+        judge_counts = build_judge_counts(daily_counts, name)
         member_rest_dates = rest_exempt.get(name, [])
-
-        for i, d in enumerate(week_dates):
-            if d in member_rest_dates:
-                status[d] = "휴식"
-                continue
-            if d in preupload_exempt:
-                status[d] = "선업로드"
-                continue
-            if skip_next:
-                skip_next = False
-                if d not in status:
-                    status[d] = "정상" if daily_counts[d] >= 1 else "결석"
-                continue
-
-            count = daily_counts[d]
-            if count >= 1:
-                status[d] = "정상"
-            else:
-                if i + 1 < len(week_dates):
-                    next_challenge_d = week_dates[i + 1]
-                    next_calendar_d = d + timedelta(days=1)
-
-                    if next_challenge_d in member_rest_dates or next_challenge_d in preupload_exempt:
-                        status[d] = "결석"
-                    elif next_calendar_d != next_challenge_d and next_calendar_d.weekday() not in challenge_days:
-                        # 바로 다음 캘린더 날짜가 챌린지일이 아닌 경우 (예: 화→수 비챌린지)
-                        # 그 날 1장 이상 올리면 지각, 없으면 다음 챌린지일 장수로 판단
-                        next_cal_count = daily_counts.get(next_calendar_d, 0)
-                        if next_cal_count >= 1:
-                            status[d] = "지각"
-                        else:
-                            next_count = daily_counts.get(next_challenge_d, 0)
-                            if next_count >= 2:
-                                status[d] = "지각"
-                                status[next_challenge_d] = "정상"
-                                skip_next = True
-                            else:
-                                status[d] = "결석"
-                    else:
-                        # 바로 다음 캘린더 날짜가 다음 챌린지일인 경우 (예: 월→화)
-                        next_count = daily_counts.get(next_challenge_d, 0)
-                        if next_count >= 2:
-                            status[d] = "지각"
-                            status[next_challenge_d] = "정상"
-                            skip_next = True
-                        else:
-                            status[d] = "결석"
-                else:
-                    # 마지막 챌린지일: 바로 다음 캘린더 날짜가 챌린지일이 아니면 지각 인정
-                    next_calendar_day = d + timedelta(days=1)
-                    if next_calendar_day.weekday() not in challenge_days:
-                        next_count = daily_counts.get(next_calendar_day, 0)
-                        status[d] = "지각" if next_count >= 1 else "결석"
-                    else:
-                        status[d] = "결석"
+        overrides = {}
+        for d in week_dates:
+            ov = store.get_override(d, name)
+            if ov is not None:
+                overrides[d] = ov
+        status = judge_member_week(week_dates, judge_counts, member_rest_dates, preupload_exempt, overrides)
 
         results[name] = status
 
@@ -538,6 +653,112 @@ def build_weekly_report(results: dict, week_dates: list) -> discord.Embed:
     return embed
 
 
+# =====================================================
+# 벌금 원장
+# =====================================================
+
+def _make_fine_record(late: int, absent: int, amount: int) -> dict:
+    """벌금 레코드 기본 형태 생성."""
+    return {
+        "late": late,
+        "absent": absent,
+        "amount": amount,
+        "paid": False,
+        "paid_at": None,
+        "edited": False,
+        "edit_reason": None,
+    }
+
+
+def count_fine_from_status(status: dict) -> tuple:
+    """주간 상태 dict → (지각 수, 결석 수, 벌금액)."""
+    late   = sum(1 for v in status.values() if v == "지각")
+    absent = sum(1 for v in status.values() if v == "결석")
+    amount = late * cfg.get("fine_late") + absent * cfg.get("fine_absent")
+    return late, absent, amount
+
+
+def settle_week_fines(week_monday_date, results: dict):
+    """
+    주간 판정 결과로 해당 주 벌금 원장 기록.
+    이미 납부(paid) 또는 수동 수정(edited)된 레코드는 절대 건드리지 않아요 —
+    낸 돈이 다시 미납으로 살아나면 안 되니까요.
+    """
+    week = store.get_week_fines(week_monday_date)
+    for name, status in results.items():
+        late, absent, amount = count_fine_from_status(status)
+        existing = week.get(name)
+        if existing and (existing.get("paid") or existing.get("edited")):
+            continue  # 납부/수정 완료 기록은 동결
+        if amount == 0 and existing is None:
+            continue  # 벌금 없는 참여자는 기록 생략
+        week[name] = _make_fine_record(late, absent, amount)
+    store.set_week_fines(week_monday_date, week)
+
+
+def update_member_ledger(week_monday_date, name: str, status: dict) -> str:
+    """
+    출석 보정 후 해당 주 벌금 레코드 재계산.
+    반환: "unsettled"(아직 정산 전) | "frozen"(납부/수정 동결) | "updated"(반영 완료)
+    """
+    if not store.has_week_fines(week_monday_date):
+        return "unsettled"
+    rec = store.get_member_fine(week_monday_date, name)
+    if rec and (rec.get("paid") or rec.get("edited")):
+        return "frozen"
+    late, absent, amount = count_fine_from_status(status)
+    if amount == 0 and rec is None:
+        return "updated"  # 원래도 없고 지금도 0원 — 기록할 것 없음
+    store.set_member_fine(week_monday_date, name, _make_fine_record(late, absent, amount))
+    return "updated"
+
+
+def get_outstanding_fines() -> dict:
+    """전체 원장에서 미납 벌금 집계 → { 이름: {"amount": 총액, "weeks": 미납 주 수} }."""
+    outstanding = {}
+    for week_key, members in store.get_all_fines().items():
+        for name, rec in members.items():
+            if rec.get("paid"):
+                continue
+            amount = rec.get("amount", 0)
+            if amount <= 0:
+                continue
+            o = outstanding.setdefault(name, {"amount": 0, "weeks": 0})
+            o["amount"] += amount
+            o["weeks"] += 1
+    return outstanding
+
+
+def build_fine_summary_embed(guild: discord.Guild) -> discord.Embed:
+    """미납 벌금 현황 임베드."""
+    outstanding = get_outstanding_fines()
+    total_members = len(get_participant_channels(guild))
+
+    if not outstanding:
+        embed = discord.Embed(
+            title="💸 미납 벌금 현황",
+            description="🎉 미납 벌금이 없어요! 전원 정산 완료",
+            color=0x2ecc71,
+        )
+        embed.set_footer(text=f"총 {total_members}명 전원 정산 완료 🎉")
+    else:
+        lines = [
+            f"• {name} — {o['amount']:,}원 ({o['weeks']}주치)"
+            for name, o in sorted(outstanding.items(), key=lambda x: (-x[1]["amount"], x[0]))
+        ]
+        total = sum(o["amount"] for o in outstanding.values())
+        lines.append(f"**합계 {total:,}원**")
+        embed = discord.Embed(
+            title="💸 미납 벌금 현황",
+            description="\n".join(lines),
+            color=0xe67e22,
+        )
+        embed.set_footer(text=f"총 {total_members}명 중 {len(outstanding)}명 미납 · /벌금납부 로 정리")
+
+    embed.timestamp = datetime.now(TZ)
+    return embed
+
+
 async def post_attendance_report(guild: discord.Guild, date=None, interaction: discord.Interaction = None):
     ch = await get_attendance_channel(guild)
     if ch is None:
@@ -565,11 +786,13 @@ async def post_attendance_report(guild: discord.Guild, date=None, interaction: d
 
 @tasks.loop(minutes=1)
 async def auto_report_task():
-    """매일 AUTO_REPORT_HOUR:AUTO_REPORT_MINUTE에 출석 결과 자동 발표."""
+    """매일 AUTO_REPORT_HOUR:AUTO_REPORT_MINUTE에 출석 결과 자동 발표 + 일일 스냅샷 기록."""
     now = datetime.now(TZ)
     if now.hour == cfg.get("auto_report_hour") and now.minute == cfg.get("auto_report_minute"):
         for guild in bot.guilds:
             await post_attendance_report(guild)
+            # 발표 직후 그날의 기록을 동결 (이미 기록된 날짜면 아무 일도 안 함)
+            await record_daily_snapshot(guild, get_challenge_date(now))
 
 
 @tasks.loop(minutes=1)
@@ -615,25 +838,58 @@ async def midnight_reminder_task():
 
 @tasks.loop(minutes=1)
 async def weekly_settlement_task():
-    """매주 마지막 챌린지 요일 AUTO_REPORT 시각에 주간 정산 자동 발표."""
-    now = datetime.now(TZ)
-    if now.hour != cfg.get("auto_report_hour") or now.minute != cfg.get("auto_report_minute"):
-        return
+    """
+    주간 정산 자동 발표.
+    마지막 챌린지 요일 '다음날'(챌린지 날짜 기준)의 발표 시각에 실행돼요 —
+    예: 월~금 챌린지면 챌린지 날짜 토요일, 즉 일요일 새벽 발표.
+    토요일 업로드가 금요일 지각으로 인정된 뒤에 정산되도록 하기 위해서예요.
 
-    today = get_challenge_date(now)
+    봇 재시작 등으로 정확한 시각을 놓쳐도, meta.json의 마지막 정산 주를 확인해서
+    아직 정산 안 된 주가 있으면 뒤늦게라도 실행해요. (같은 주 중복 정산은 없음)
+    """
+    now = datetime.now(TZ)
     challenge_days = cfg.get("challenge_days")
     if not challenge_days:
         return
-    if today.weekday() != max(challenge_days):
+
+    settle_weekday = (max(challenge_days) + 1) % 7  # 정산 기준 요일 (챌린지 날짜 기준)
+    today = get_challenge_date(now)
+
+    # 가장 최근의 정산 기준일 (챌린지 날짜) 계산
+    days_since = (today.weekday() - settle_weekday) % 7
+    target = today - timedelta(days=days_since)
+
+    # 오늘이 정산 기준일이면 발표 시각이 지났는지 확인
+    if days_since == 0 and (now.hour, now.minute) < (cfg.get("auto_report_hour"), cfg.get("auto_report_minute")):
         return
+
+    week_monday_date = target - timedelta(days=target.weekday())
+    last = store.get_last_settled_week()
+    if last is not None and last >= week_monday_date:
+        return  # 이미 정산된 주
 
     for guild in bot.guilds:
         ch = await get_weekly_channel(guild)
         if ch is None:
             continue
-        results, week_dates = await calc_weekly_result(guild)
+
+        # 스냅샷이 누락된 날짜 보충 기록 (이미 기록된 날은 그대로 둠)
+        d = week_monday_date
+        while d <= target:
+            await record_daily_snapshot(guild, d)
+            d += timedelta(days=1)
+
+        results, week_dates = await calc_weekly_result(guild, target)
         embed = build_weekly_report(results, week_dates)
         await ch.send(embed=embed)
+
+        # 벌금 원장 기록 + 미납 현황 발표 (벌금 채널)
+        settle_week_fines(week_monday_date, results)
+        fine_ch = await get_fine_channel(guild)
+        if fine_ch is not None:
+            await fine_ch.send(embed=build_fine_summary_embed(guild))
+
+    store.set_last_settled_week(week_monday_date)
 
 
 # =====================================================
@@ -737,6 +993,7 @@ async def slash_config_view(interaction: discord.Interaction):
     embed = discord.Embed(title="⚙️ 현재 봇 설정", color=0x9b59b6)
     embed.add_field(name="출석 채널",      value=f"#{cfg.get('attendance_channel')}", inline=True)
     embed.add_field(name="주간 정산 채널", value=f"#{weekly_ch}" if weekly_ch else f"#{cfg.get('attendance_channel')} (동일)", inline=True)
+    embed.add_field(name="벌금 채널",      value=f"#{cfg.get('fine_channel')}" if cfg.get("fine_channel") else "정산 채널과 동일", inline=True)
     embed.add_field(name="휴식 신청 채널", value=f"#{cfg.get('rest_channel')}", inline=True)
     embed.add_field(name="하루 기준 시각", value=f"{cfg.get('day_start_hour')}시", inline=True)
     embed.add_field(name="자동 발표 시각", value=f"{cfg.get('auto_report_hour'):02d}:{cfg.get('auto_report_minute'):02d}", inline=True)
@@ -746,7 +1003,10 @@ async def slash_config_view(interaction: discord.Interaction):
     embed.add_field(name="지각 벌금",      value=f"{cfg.get('fine_late'):,}원", inline=True)
     embed.add_field(name="결석 벌금",      value=f"{cfg.get('fine_absent'):,}원", inline=True)
     embed.add_field(name="타임존",         value=config.TIMEZONE, inline=True)
-    embed.set_footer(text="/설정변경출석채널 | /설정변경정산채널 | /설정변경휴식채널 | /설정변경발표시각 | /설정변경주제 | /설정변경기준시각 | /설정변경참여일 | /설정변경접두사 | /설정변경지각비 | /설정변경결석비")
+    embed.set_footer(text=(
+        "/설정변경출석채널 | /설정변경정산채널 | /설정변경벌금채널 | /설정변경휴식채널 | /설정변경발표시각 | /설정변경주제 | /설정변경기준시각 | /설정변경참여일 | /설정변경접두사 | /설정변경지각비 | /설정변경결석비\n"
+        "💸 /벌금현황 /벌금납부 /벌금내역 /벌금수정 /벌금취소 /벌금정산 | ✏️ /출석수정 /출석수정취소"
+    ))
     await interaction.response.send_message(embed=embed)
 
 
@@ -766,6 +1026,13 @@ async def slash_set_channel(interaction: discord.Interaction, 채널: discord.Te
 async def slash_set_weekly_channel(interaction: discord.Interaction, 채널: discord.TextChannel):
     cfg.set_and_save("weekly_channel", 채널.name)
     await interaction.response.send_message(f"✅ 주간 정산 채널이 {채널.mention} 으로 변경됐어요!")
+
+
+@bot.tree.command(name="설정변경벌금채널", description="벌금 현황을 발표할 채널을 변경합니다.")
+@app_commands.describe(채널="벌금 현황을 올릴 채널")
+async def slash_set_fine_channel(interaction: discord.Interaction, 채널: discord.TextChannel):
+    cfg.set_and_save("fine_channel", 채널.name)
+    await interaction.response.send_message(f"✅ 벌금 채널이 {채널.mention} 으로 변경됐어요!")
 
 
 @bot.tree.command(name="설정변경휴식채널", description="개인사정 휴식 신청 채널을 변경합니다. (기본: 휴식)")
@@ -951,6 +1218,380 @@ async def slash_member_list(interaction: discord.Interaction):
 
 
 # =====================================================
+# 슬래시 커맨드 — 벌금 관리
+# =====================================================
+
+UNREGISTERED_MSG = "❗ {name} 님은 등록된 참여자가 아니에요. `/참여자등록`으로 채널과 연결해주세요."
+DATE_FORMAT_MSG = "❗ 날짜 형식이 올바르지 않아요. `YYYY-MM-DD` 형식으로 입력해주세요."
+
+
+def _parse_week_key(주차: str):
+    """'YYYY-MM-DD' → 해당 주 월요일 date. 실패 시 None."""
+    try:
+        return store.week_monday(datetime.strptime(주차, "%Y-%m-%d").date())
+    except ValueError:
+        return None
+
+
+@bot.tree.command(name="벌금현황", description="현재 미납 벌금 현황을 보여줍니다.")
+async def slash_fine_status(interaction: discord.Interaction):
+    await interaction.response.send_message(embed=build_fine_summary_embed(interaction.guild))
+
+
+@bot.tree.command(name="벌금납부", description="벌금 납부를 기록합니다. 주차 생략 시 해당 멤버의 미납 전체를 정리합니다.")
+@app_commands.describe(멤버="납부한 참여자", 주차="납부할 주의 날짜 (YYYY-MM-DD, 그 주 아무 날짜나 가능. 생략 시 미납 전체)")
+async def slash_fine_pay(interaction: discord.Interaction, 멤버: discord.Member, 주차: str = None):
+    name = get_participant_name(멤버)
+    if name is None:
+        await interaction.response.send_message(UNREGISTERED_MSG.format(name=멤버.display_name), ephemeral=True)
+        return
+
+    target_key = None
+    if 주차:
+        monday = _parse_week_key(주차)
+        if monday is None:
+            await interaction.response.send_message(DATE_FORMAT_MSG, ephemeral=True)
+            return
+        target_key = monday.isoformat()
+
+    today_iso = datetime.now(TZ).date().isoformat()
+    cleared = []
+    for week_key in sorted(store.get_all_fines().keys()):
+        if target_key and week_key != target_key:
+            continue
+        rec = store.get_member_fine(week_key, name)
+        if rec is None or rec.get("paid") or rec.get("amount", 0) <= 0:
+            continue
+        rec["paid"] = True
+        rec["paid_at"] = today_iso
+        store.set_member_fine(week_key, name, rec)
+        cleared.append((week_key, rec["amount"]))
+
+    if not cleared:
+        if target_key:
+            await interaction.response.send_message(f"❗ **{name}** 님은 {format_week_label(target_key)}에 미납 벌금이 없어요.", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"🎉 **{name}** 님은 미납 벌금이 없어요!", ephemeral=True)
+        return
+
+    total = sum(a for _, a in cleared)
+    remaining = get_outstanding_fines().get(name, {}).get("amount", 0)
+    lines = [f"• {format_week_label(k)} — {a:,}원" for k, a in cleared]
+
+    embed = discord.Embed(title=f"💰 {name} 벌금 납부 완료", description="\n".join(lines), color=0x2ecc71)
+    embed.add_field(name="납부 금액", value=f"**{total:,}원**", inline=True)
+    embed.add_field(name="남은 미납", value=f"{remaining:,}원" if remaining else "없음 🎉", inline=True)
+    embed.timestamp = datetime.now(TZ)
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="벌금내역", description="벌금 발생/납부 전체 내역을 보여줍니다. 멤버 생략 시 전원 요약.")
+@app_commands.describe(멤버="조회할 참여자 (생략 시 전원 요약)")
+async def slash_fine_history(interaction: discord.Interaction, 멤버: discord.Member = None):
+    all_fines = store.get_all_fines()
+
+    if 멤버 is not None:
+        name = get_participant_name(멤버)
+        if name is None:
+            await interaction.response.send_message(UNREGISTERED_MSG.format(name=멤버.display_name), ephemeral=True)
+            return
+
+        lines = []
+        unpaid_total = 0
+        paid_total = 0
+        for week_key in sorted(all_fines.keys()):
+            rec = all_fines[week_key].get(name)
+            if rec is None:
+                continue
+            amount = rec.get("amount", 0)
+            edited_mark = " (수정됨)" if rec.get("edited") else ""
+            if rec.get("paid"):
+                paid_total += amount
+                lines.append(f"• {format_week_label(week_key)} — {amount:,}원{edited_mark} ✅ 납부 ({rec.get('paid_at') or '-'})")
+            else:
+                unpaid_total += amount
+                lines.append(f"• {format_week_label(week_key)} — {amount:,}원{edited_mark} ❌ 미납")
+
+        if not lines:
+            await interaction.response.send_message(f"📭 **{name}** 님은 벌금 기록이 없어요!", ephemeral=True)
+            return
+
+        total = unpaid_total + paid_total
+        lines.append("")
+        lines.append(f"**미납 {unpaid_total:,}원 / 누적 납부 {paid_total:,}원 / 총 발생 {total:,}원**")
+        embed = discord.Embed(title=f"💸 {name} 벌금 내역", description="\n".join(lines), color=0x3498db)
+    else:
+        # 전원 요약
+        per_member = {}  # 이름 → [미납, 납부]
+        for week_key, members in all_fines.items():
+            for name, rec in members.items():
+                amount = rec.get("amount", 0)
+                sums = per_member.setdefault(name, [0, 0])
+                if rec.get("paid"):
+                    sums[1] += amount
+                else:
+                    sums[0] += amount
+
+        if not per_member:
+            await interaction.response.send_message("📭 아직 벌금 기록이 없어요!", ephemeral=True)
+            return
+
+        lines = [
+            f"• {name} — 미납 {u:,}원 / 납부 {p:,}원 / 총 {u + p:,}원"
+            for name, (u, p) in sorted(per_member.items(), key=lambda x: (-x[1][0], x[0]))
+        ]
+        total_unpaid = sum(u for u, _ in per_member.values())
+        total_paid   = sum(p for _, p in per_member.values())
+        lines.append("")
+        lines.append(f"**전체 미납 {total_unpaid:,}원 / 누적 납부 {total_paid:,}원 / 총 발생 {total_unpaid + total_paid:,}원**")
+        embed = discord.Embed(title="💸 전체 벌금 내역 요약", description="\n".join(lines), color=0x3498db)
+
+    embed.set_footer(text="/벌금납부 로 납부 처리 · /벌금내역 멤버:@이름 으로 상세 조회")
+    embed.timestamp = datetime.now(TZ)
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="벌금취소", description="잘못 기록된 벌금 납부를 취소합니다. (다시 미납 상태로)")
+@app_commands.describe(멤버="납부를 취소할 참여자", 주차="해당 주의 날짜 (YYYY-MM-DD, 그 주 아무 날짜나 가능)")
+async def slash_fine_unpay(interaction: discord.Interaction, 멤버: discord.Member, 주차: str):
+    name = get_participant_name(멤버)
+    if name is None:
+        await interaction.response.send_message(UNREGISTERED_MSG.format(name=멤버.display_name), ephemeral=True)
+        return
+    monday = _parse_week_key(주차)
+    if monday is None:
+        await interaction.response.send_message(DATE_FORMAT_MSG, ephemeral=True)
+        return
+
+    rec = store.get_member_fine(monday, name)
+    label = format_week_label(monday)
+    if rec is None:
+        await interaction.response.send_message(f"❗ **{name}** 님은 {label}에 벌금 기록이 없어요.", ephemeral=True)
+        return
+    if not rec.get("paid"):
+        await interaction.response.send_message(f"❗ **{name}** 님의 {label} 벌금은 아직 납부 처리되지 않았어요.", ephemeral=True)
+        return
+
+    rec["paid"] = False
+    rec["paid_at"] = None
+    store.set_member_fine(monday, name, rec)
+    await interaction.response.send_message(
+        f"↩️ **{name}** 님의 {label} 납부 기록을 취소했어요. ({rec.get('amount', 0):,}원이 다시 미납으로 돌아갔어요)"
+    )
+
+
+@bot.tree.command(name="벌금수정", description="특정 주의 벌금 금액을 직접 수정합니다. (정산 재계산에서 보호됨)")
+@app_commands.describe(멤버="수정할 참여자", 주차="해당 주의 날짜 (YYYY-MM-DD)", 금액="새 벌금 금액 (원)", 사유="수정 사유 (선택)")
+async def slash_fine_edit(interaction: discord.Interaction, 멤버: discord.Member, 주차: str, 금액: int, 사유: str = None):
+    name = get_participant_name(멤버)
+    if name is None:
+        await interaction.response.send_message(UNREGISTERED_MSG.format(name=멤버.display_name), ephemeral=True)
+        return
+    monday = _parse_week_key(주차)
+    if monday is None:
+        await interaction.response.send_message(DATE_FORMAT_MSG, ephemeral=True)
+        return
+    if 금액 < 0:
+        await interaction.response.send_message("❗ 0 이상의 숫자를 입력해주세요.", ephemeral=True)
+        return
+
+    rec = store.get_member_fine(monday, name)
+    if rec is None:
+        rec = _make_fine_record(0, 0, 0)
+    old_amount = rec.get("amount", 0)
+    rec["amount"] = 금액
+    rec["edited"] = True
+    rec["edit_reason"] = 사유
+    store.set_member_fine(monday, name, rec)
+
+    embed = discord.Embed(title="✏️ 벌금 수정 완료", color=0x2ecc71)
+    embed.add_field(name="멤버", value=name, inline=True)
+    embed.add_field(name="주차", value=format_week_label(monday), inline=True)
+    embed.add_field(name="금액", value=f"{old_amount:,}원 → **{금액:,}원**", inline=True)
+    if 사유:
+        embed.add_field(name="사유", value=사유, inline=False)
+    embed.set_footer(text="수정된 주는 정산 재계산 때 금액이 덮어써지지 않아요")
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="벌금정산", description="지난 주의 벌금을 수동으로 정산해 원장에 기록합니다. (기능 도입 전 과거 주 백필용)")
+@app_commands.describe(주차="정산할 주의 날짜 (YYYY-MM-DD, 그 주 아무 날짜나 가능)")
+async def slash_fine_settle(interaction: discord.Interaction, 주차: str):
+    monday = _parse_week_key(주차)
+    if monday is None:
+        await interaction.response.send_message(DATE_FORMAT_MSG, ephemeral=True)
+        return
+    challenge_days = cfg.get("challenge_days")
+    if not challenge_days:
+        await interaction.response.send_message("❗ 챌린지 참여일이 설정되어 있지 않아요.", ephemeral=True)
+        return
+
+    # 해당 주의 정산 시점(마지막 챌린지 요일 다음날의 발표 시각)이 지났는지 확인
+    now = datetime.now(TZ)
+    today = get_challenge_date(now)
+    settle_weekday = (max(challenge_days) + 1) % 7
+    target = monday + timedelta(days=settle_weekday)  # 정산 기준 챌린지 날짜
+    if today < target or (
+        today == target and (now.hour, now.minute) < (cfg.get("auto_report_hour"), cfg.get("auto_report_minute"))
+    ):
+        await interaction.response.send_message(
+            "❗ 아직 끝나지 않은 주예요. 이번 주는 자동 정산을 기다려주세요!", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer()
+
+    # 스냅샷 기록과 last_settled_week은 건드리지 않아요 —
+    # 지금 스냅샷을 찍으면 이미 왜곡됐을 수 있는 값이 동결되고,
+    # 정산 주를 옮기면 자동 정산이 빠지거나 중복될 수 있어서예요.
+    results, week_dates = await calc_weekly_result(interaction.guild, target)
+    report_embed = build_weekly_report(results, week_dates)
+
+    # 원장 기록 (납부/수정 완료 기록은 settle_week_fines가 알아서 동결)
+    before = store.get_week_fines(monday)
+    settle_week_fines(monday, results)
+
+    lines = []
+    for name, status in results.items():
+        _, _, amount = count_fine_from_status(status)
+        existing = before.get(name)
+        if existing and (existing.get("paid") or existing.get("edited")):
+            reason = "납부 완료" if existing.get("paid") else "수동 수정"
+            lines.append(f"• {name} — {existing.get('amount', 0):,}원 유지 (이미 {reason}된 기록이라 건너뜀)")
+        elif amount > 0:
+            lines.append(f"• {name} — {amount:,}원 기록")
+
+    ledger_embed = discord.Embed(
+        title=f"🧾 {format_week_label(monday)} 벌금 원장 기록",
+        description="\n".join(lines) if lines else "🎉 이 주는 벌금 대상이 없어요!",
+        color=0x9b59b6,
+    )
+    ledger_embed.add_field(
+        name="⚠️ 참고",
+        value=(
+            "과거 주는 지금 채널에 남아 있는 이미지 기준으로 판정돼요.\n"
+            "지웠다가 나중에 다시 올린 이미지는 다시 올린 날짜로 집계되니, "
+            "그런 날은 `/출석수정`으로 바로잡아주세요."
+        ),
+        inline=False,
+    )
+    ledger_embed.timestamp = datetime.now(TZ)
+
+    # 백필 작업이라 공개 채널을 시끄럽게 하지 않고 이 자리에서 바로 답해요
+    await interaction.followup.send(embeds=[report_embed, ledger_embed])
+
+
+# =====================================================
+# 슬래시 커맨드 — 출석 수동 보정
+# =====================================================
+
+async def _apply_attendance_override(interaction: discord.Interaction, 멤버: discord.Member, 날짜: str, new_status):
+    """출석 수동 보정 적용/해제 공통 처리. new_status가 None이면 보정 해제."""
+    await interaction.response.defer()
+
+    name = get_participant_name(멤버)
+    if name is None:
+        await interaction.followup.send(UNREGISTERED_MSG.format(name=멤버.display_name), ephemeral=True)
+        return
+    try:
+        date = datetime.strptime(날짜, "%Y-%m-%d").date()
+    except ValueError:
+        await interaction.followup.send(DATE_FORMAT_MSG, ephemeral=True)
+        return
+    if date.weekday() not in cfg.get("challenge_days"):
+        await interaction.followup.send("❗ 해당 날짜는 챌린지 요일이 아니에요.", ephemeral=True)
+        return
+    today = get_challenge_date()
+    if date > today:
+        await interaction.followup.send("❗ 아직 지나지 않은 날짜는 보정할 수 없어요.", ephemeral=True)
+        return
+
+    old_override = store.get_override(date, name)
+    if new_status is None and old_override is None:
+        await interaction.followup.send(f"❗ **{name}** 님의 {날짜} 에는 보정 기록이 없어요.", ephemeral=True)
+        return
+
+    channel = discord.utils.get(interaction.guild.text_channels, name=cfg.get("channel_prefix") + name)
+    if channel is None:
+        await interaction.followup.send(f"❗ **{name}** 님의 참여자 채널을 찾을 수 없어요.", ephemeral=True)
+        return
+
+    monday = store.week_monday(date)
+    ref = min(today, monday + timedelta(days=6))
+    week_dates = get_week_dates(ref)
+
+    # 보정 전/후 판정 비교 (해당 멤버 채널만 스캔)
+    rest_exempt = await get_rest_exempt_dates(interaction.guild, cfg.get("rest_channel"), week_dates[0] if week_dates else date)
+    scan = await scan_channel(channel, week_dates)
+    judge_counts = build_judge_counts(scan["daily_counts"], name)
+    member_rest_dates = rest_exempt.get(name, [])
+
+    base_overrides = {}
+    for d in week_dates:
+        ov = store.get_override(d, name)
+        if ov is not None:
+            base_overrides[d] = ov
+
+    old_status_map = judge_member_week(week_dates, judge_counts, member_rest_dates, scan["preupload_exempt"], base_overrides)
+
+    new_overrides = dict(base_overrides)
+    if new_status is None:
+        new_overrides.pop(date, None)
+    else:
+        new_overrides[date] = new_status
+    new_status_map = judge_member_week(week_dates, judge_counts, member_rest_dates, scan["preupload_exempt"], new_overrides)
+
+    # 저장
+    if new_status is None:
+        store.remove_override(date, name)
+    else:
+        store.set_override(date, name, new_status)
+
+    # 정산된 주라면 벌금 원장에도 반영
+    ledger_result = update_member_ledger(monday, name, new_status_map)
+    ledger_msg = {
+        "unsettled": "이 주는 아직 정산 전이라, 정산 때 자동으로 반영돼요.",
+        "frozen": "이미 납부/수정된 주라서 벌금 원장 금액은 그대로 뒀어요.",
+        "updated": "벌금 원장에 바로 반영했어요.",
+    }[ledger_result]
+
+    _, _, old_amount = count_fine_from_status(old_status_map)
+    _, _, new_amount = count_fine_from_status(new_status_map)
+    before = old_status_map.get(date, "결석")
+    after  = new_status_map.get(date, "결석")
+
+    embed = discord.Embed(
+        title="✅ 출석 보정 완료" if new_status else "↩️ 출석 보정 해제 완료",
+        color=0x2ecc71,
+    )
+    embed.add_field(name="멤버", value=name, inline=True)
+    embed.add_field(name="날짜", value=날짜, inline=True)
+    embed.add_field(name="상태", value=f"{before} → **{after}**", inline=True)
+    embed.add_field(name="해당 주 벌금", value=f"{old_amount:,}원 → **{new_amount:,}원**\n{ledger_msg}", inline=False)
+    embed.timestamp = datetime.now(TZ)
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="출석수정", description="특정 날짜의 출석 판정을 수동으로 보정합니다. (자동 판정보다 우선)")
+@app_commands.describe(멤버="보정할 참여자", 날짜="보정할 날짜 (YYYY-MM-DD)", 상태="적용할 상태")
+@app_commands.choices(상태=[
+    app_commands.Choice(name="정상", value="정상"),
+    app_commands.Choice(name="지각", value="지각"),
+    app_commands.Choice(name="결석", value="결석"),
+    app_commands.Choice(name="휴식", value="휴식"),
+    app_commands.Choice(name="선업로드", value="선업로드"),
+])
+async def slash_attendance_edit(interaction: discord.Interaction, 멤버: discord.Member, 날짜: str, 상태: app_commands.Choice[str]):
+    await _apply_attendance_override(interaction, 멤버, 날짜, 상태.value)
+
+
+@bot.tree.command(name="출석수정취소", description="출석 수동 보정을 제거하고 자동 판정으로 되돌립니다.")
+@app_commands.describe(멤버="보정을 취소할 참여자", 날짜="보정을 취소할 날짜 (YYYY-MM-DD)")
+async def slash_attendance_edit_cancel(interaction: discord.Interaction, 멤버: discord.Member, 날짜: str):
+    await _apply_attendance_override(interaction, 멤버, 날짜, None)
+
+
+# =====================================================
 # 봇 이벤트
 # =====================================================
 
@@ -970,7 +1611,7 @@ async def on_ready():
     m = cfg.get('auto_report_minute')
     print(f"✅ 자동 출석 발표: 매일 {h:02d}:{m:02d}")
     print(f"✅ 자정 미참여 알림: 매일 00:00")
-    print(f"✅ 주간 정산 자동 발표: 매주 마지막 챌린지 요일 {h:02d}:{m:02d}")
+    print(f"✅ 주간 정산 자동 발표: 매주 마지막 챌린지 요일 다음날 {h:02d}:{m:02d} (놓친 주는 재시작 후 보정 실행)")
 
 
 @bot.event
