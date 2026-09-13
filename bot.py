@@ -924,6 +924,11 @@ async def weekly_settlement_task():
         settle_day.year, settle_day.month, settle_day.day,
         cfg.get("auto_report_hour"), cfg.get("auto_report_minute"),
     ))
+    # 발표 시각을 하루 기준 시각보다 이르게 설정해도(예: 05:00) 대상 하루가
+    # 끝나기 전에 정산되지 않도록, 하루가 실제로 닫히는 시점 이후로 보정해요.
+    day_close = get_day_range(target)[1]
+    if settle_at < day_close:
+        settle_at = day_close
     if now < settle_at:
         return
 
