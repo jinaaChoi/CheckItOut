@@ -808,15 +808,46 @@ async def post_attendance_report(guild: discord.Guild, date=None, interaction: d
 # 자동 태스크
 # =====================================================
 
+def get_last_finished_date(now: datetime = None):
+    """
+    하루가 완전히 끝난 가장 최근 챌린지 날짜.
+
+    챌린지 날짜 D의 하루는 (D+1일 기준시각)에 끝나요. 그래서 '지금 진행 중인 날짜'의
+    바로 전날이 마지막으로 끝난 날이에요. 발표와 기록 동결은 모두 이 날짜를 기준으로 해야
+    마감 직전 업로드가 누락되지 않아요.
+    """
+    if now is None:
+        now = datetime.now(TZ)
+    return get_challenge_date(now) - timedelta(days=1)
+
+
 @tasks.loop(minutes=1)
 async def auto_report_task():
-    """매일 AUTO_REPORT_HOUR:AUTO_REPORT_MINUTE에 출석 결과 자동 발표 + 일일 스냅샷 기록."""
+    """매일 AUTO_REPORT_HOUR:AUTO_REPORT_MINUTE에 '완전히 끝난 하루'의 출석 결과 발표."""
     now = datetime.now(TZ)
     if now.hour == cfg.get("auto_report_hour") and now.minute == cfg.get("auto_report_minute"):
         for guild in bot.guilds:
-            await post_attendance_report(guild)
-            # 발표 직후 그날의 기록을 동결 (이미 기록된 날짜면 아무 일도 안 함)
-            await record_daily_snapshot(guild, get_challenge_date(now))
+            await post_attendance_report(guild, date=get_last_finished_date(now))
+
+
+@tasks.loop(minutes=1)
+async def snapshot_task():
+    """
+    하루가 완전히 끝난 뒤에 그날의 출석 기록을 동결.
+
+    발표 시각(예: 05:58)에 찍으면, 하루 기준 시각(06:00)까지 남은 몇 분 사이의
+    업로드가 0장으로 동결돼버려요. 실제로 05:59 업로드가 결석 처리된 사고가 있었어요.
+    그래서 기준 시각이 지난 뒤에 찍고, 봇이 꺼져 있었으면 다음 기회에 자동으로 보충돼요.
+    """
+    now = datetime.now(TZ)
+    if now.hour < cfg.get("day_start_hour"):
+        return  # 어제 하루가 아직 안 끝났어요
+
+    date = get_last_finished_date(now)
+    if store.has_snapshot(date):
+        return
+    for guild in bot.guilds:
+        await record_daily_snapshot(guild, date)
 
 
 @tasks.loop(minutes=1)
@@ -1166,10 +1197,20 @@ async def slash_set_report_time(interaction: discord.Interaction, 시: int, 분:
         return
     cfg.set_and_save("auto_report_hour", 시)
     cfg.set_and_save("auto_report_minute", 분)
-    await interaction.response.send_message(
+
+    msg = (
         f"✅ 자동 발표 시각이 **{시:02d}:{분:02d}** 으로 변경됐어요!\n"
         f"매일 출석 현황 발표와 주간 정산 발표가 이 시각에 실행돼요."
     )
+    start_hour = cfg.get("day_start_hour")
+    if 시 < start_hour:
+        # 하루 기준 시각 전에 발표하면 '한 번 더 지난 날'이 발표돼요 (아직 안 끝난 하루는 발표 못 함)
+        msg += (
+            f"\n\n⚠️ 하루 기준 시각({start_hour}시)보다 이른 시각이에요.\n"
+            f"발표는 **완전히 끝난 하루**만 대상으로 하기 때문에, 이 시각에는 하루 더 이전 날짜가 발표돼요.\n"
+            f"방금 끝난 하루를 발표하려면 **{start_hour:02d}:00 이후**로 설정해주세요."
+        )
+    await interaction.response.send_message(msg)
 
 
 # =====================================================
@@ -1725,12 +1766,14 @@ async def on_ready():
         print(f"❌ 슬래시 커맨드 동기화 실패: {e}")
 
     auto_report_task.start()
+    snapshot_task.start()
     midnight_reminder_task.start()
     weekly_settlement_task.start()
     h = cfg.get('auto_report_hour')
     m = cfg.get('auto_report_minute')
     print(f"✅ 자동 출석 발표: 매일 {h:02d}:{m:02d}")
     print(f"✅ 자정 미참여 알림: 매일 00:00")
+    print(f"✅ 일일 기록 동결: 매일 {cfg.get('day_start_hour'):02d}:00 이후 (하루가 끝난 뒤)")
     print(f"✅ 주간 정산 자동 발표: 매주 마지막 챌린지 요일 다음날 {h:02d}:{m:02d} (놓친 주는 재시작 후 보정 실행)")
 
 
