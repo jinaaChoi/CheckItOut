@@ -123,35 +123,58 @@ def format_week_label(week_key) -> str:
 import re
 from datetime import date as date_type
 
-def parse_rest_dates(text: str) -> list:
+MAX_REST_RANGE_DAYS = 31  # 휴식 기간 상한 (연도 오타 방어용)
+
+
+def parse_rest_dates_checked(text: str) -> tuple:
     """
-    #휴식 채널 메시지에서 날짜 파싱.
+    #휴식 채널 메시지에서 날짜 파싱 + 유효성 검사.
     형식: [2025-06-25] 또는 [2025-06-25 ~ 2025-06-28]
-    반환: [date, date, ...] (해당 날짜들)
+
+    반환: (dates, error)
+      - error가 None이 아니면 dates는 빈 리스트 (신청 무효)
+      - 날짜 형식 자체가 없으면 ([], None) — 휴식 신청이 아닌 일반 메시지
     """
-    dates = []
     # 기간 형식: [YYYY-MM-DD ~ YYYY-MM-DD]
     range_match = re.search(r'\[(\d{4}-\d{2}-\d{2})\s*~\s*(\d{4}-\d{2}-\d{2})\]', text)
     if range_match:
         try:
             start = datetime.strptime(range_match.group(1), "%Y-%m-%d").date()
             end   = datetime.strptime(range_match.group(2), "%Y-%m-%d").date()
-            d = start
-            while d <= end:
-                dates.append(d)
-                d += timedelta(days=1)
         except ValueError:
-            pass
-        return dates
+            return [], "날짜가 올바르지 않아요. (없는 날짜인지 확인해주세요)"
+
+        if end < start:
+            return [], "끝 날짜가 시작 날짜보다 빨라요."
+
+        span = (end - start).days + 1
+        if span > MAX_REST_RANGE_DAYS:
+            return [], (
+                f"휴식 기간이 **{span:,}일**로 잡혔어요. 연도를 잘못 쓰신 건 아닐까요?\n"
+                f"(한 번에 신청 가능한 최대 기간은 {MAX_REST_RANGE_DAYS}일이에요)"
+            )
+
+        dates = []
+        d = start
+        while d <= end:
+            dates.append(d)
+            d += timedelta(days=1)
+        return dates, None
 
     # 단일 날짜 형식: [YYYY-MM-DD]
     single_match = re.search(r'\[(\d{4}-\d{2}-\d{2})\]', text)
     if single_match:
         try:
-            dates.append(datetime.strptime(single_match.group(1), "%Y-%m-%d").date())
+            return [datetime.strptime(single_match.group(1), "%Y-%m-%d").date()], None
         except ValueError:
-            pass
-    return dates
+            return [], "날짜가 올바르지 않아요. (없는 날짜인지 확인해주세요)"
+
+    return [], None
+
+
+def parse_rest_dates(text: str) -> list:
+    """#휴식 채널 메시지에서 유효한 휴식 날짜만 반환. (무효한 신청은 빈 리스트)"""
+    return parse_rest_dates_checked(text)[0]
 
 
 async def get_rest_exempt_dates(guild: discord.Guild, channel_name: str, ref_date=None) -> dict:
@@ -1749,11 +1772,42 @@ async def on_message(message: discord.Message):
 
     # ── 휴식 채널 감지 ──
     elif message.channel.name == rest_ch_name:
-        if parse_rest_dates(message.content):
+        await handle_rest_message(message)
+
+
+REST_FORMAT_HINT = "형식: `[2026-09-01]` 또는 `[2026-09-01 ~ 2026-09-03]`"
+
+
+async def handle_rest_message(message: discord.Message, edited: bool = False):
+    """
+    휴식 신청 메시지 검증 → ☑️(정상) 또는 ❌(무효) 리액션.
+    무효한 신청은 벌금 면제가 안 되므로, 이유를 답글로 알려줘요.
+    (연도 오타로 몇 년짜리 휴식이 조용히 등록되던 사고 방지)
+    """
+    dates, error = parse_rest_dates_checked(message.content or "")
+
+    async def _react(add: str, remove: str):
+        try:
+            await message.add_reaction(add)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        if edited:  # 수정으로 상태가 바뀌었으면 이전 표시 제거
             try:
-                await message.add_reaction("☑️")
-            except (discord.Forbidden, discord.HTTPException):
+                await message.remove_reaction(remove, bot.user)
+            except (discord.Forbidden, discord.HTTPException, discord.NotFound):
                 pass
+
+    if error:
+        await _react("❌", "☑️")
+        try:
+            await message.reply(
+                f"⚠️ **휴식 신청이 등록되지 않았어요.**\n{error}\n{REST_FORMAT_HINT}",
+                mention_author=True,
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+    elif dates:
+        await _react("☑️", "❌")
 
     await bot.process_commands(message)
 
@@ -1761,6 +1815,18 @@ async def on_message(message: discord.Message):
 # =====================================================
 # 실행
 # =====================================================
+
+@bot.event
+async def on_message_edit(before: discord.Message, after: discord.Message):
+    """휴식 신청을 고쳤을 때 다시 검증. (오타 수정 후 바로 ☑️로 바뀌도록)"""
+    if after.author.bot or not after.guild:
+        return
+    if after.channel.name != cfg.get("rest_channel"):
+        return
+    if (before.content or "") == (after.content or ""):
+        return
+    await handle_rest_message(after, edited=True)
+
 
 if __name__ == "__main__":
     if not TOKEN:
