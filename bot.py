@@ -316,19 +316,18 @@ async def check_attendance(guild: discord.Guild, date=None) -> dict:
     for ch in channels:
         name = get_member_name_from_channel(ch)
 
-        # 휴식 면제 체크
-        if date in rest_exempt.get(name, []):
-            result[name] = "휴식"
-            continue
-
         # scan_channel로 한 번에 처리
         scan = await scan_channel(ch, [date])
         daily_counts     = scan["daily_counts"]
         preupload_exempt = scan["preupload_exempt"]
+        count            = daily_counts.get(date, 0)
 
-        if date in preupload_exempt:
+        if date in rest_exempt.get(name, []):
+            # 휴식 신청일이라도 실제로 올렸으면 참여로 인정 (주간 판정과 동일 규칙)
+            result[name] = "정상" if count >= 1 else "휴식"
+        elif date in preupload_exempt:
             result[name] = "선업로드"
-        elif daily_counts.get(date, 0) >= 1:
+        elif count >= 1:
             result[name] = "정상"
         else:
             result[name] = "미참여"
@@ -473,7 +472,9 @@ def judge_member_week(week_dates: list, judge_counts: dict, member_rest_dates: l
             skip_next = False
             continue
         if d in member_rest_dates:
-            status[d] = "휴식"
+            # 휴식 신청일이라도 실제로 올렸으면 참여로 인정해요.
+            # (벌금은 어차피 둘 다 0원이고, 기록이 실제 참여를 반영하는 게 맞아서)
+            status[d] = "정상" if judge_counts.get(d, 0) >= 1 else "휴식"
             continue
         if d in preupload_exempt:
             status[d] = "선업로드"
@@ -859,8 +860,17 @@ async def weekly_settlement_task():
     days_since = (today.weekday() - settle_weekday) % 7
     target = today - timedelta(days=days_since)
 
-    # 오늘이 정산 기준일이면 발표 시각이 지났는지 확인
-    if days_since == 0 and (now.hour, now.minute) < (cfg.get("auto_report_hour"), cfg.get("auto_report_minute")):
+    # 정산 실행 시각 = 대상 챌린지 날짜의 '다음 캘린더 날짜' 발표 시각.
+    # 챌린지 날짜 토요일의 하루는 일요일 오전 6시에 끝나므로, 일요일 발표 시각에 정산해야
+    # 토요일 업로드(금요일 지각분)까지 반영돼요.
+    # ※ 단순히 요일+시각만 비교하면 토요일 오전 6시에 바로 실행돼버려서
+    #    정작 토요일 업로드를 하나도 못 보는 문제가 있었어요.
+    settle_day = target + timedelta(days=1)
+    settle_at = TZ.localize(datetime(
+        settle_day.year, settle_day.month, settle_day.day,
+        cfg.get("auto_report_hour"), cfg.get("auto_report_minute"),
+    ))
+    if now < settle_at:
         return
 
     week_monday_date = target - timedelta(days=target.weekday())
