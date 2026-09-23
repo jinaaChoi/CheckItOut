@@ -23,6 +23,8 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 TZ = pytz.timezone(config.TIMEZONE)
+GLOBAL_REST_EMOJI = "🎵"
+MAX_GLOBAL_REST_RANGE_DAYS = 31
 
 
 # =====================================================
@@ -41,6 +43,59 @@ def is_challenge_day(date=None) -> bool:
     if date is None:
         date = get_challenge_date()
     return date.weekday() in cfg.get("challenge_days")
+
+
+def get_global_rest_period(date):
+    """해당 날짜를 포함하는 전체 휴식 기간을 반환. 없으면 None."""
+    for period in cfg.get("global_rest_periods") or []:
+        try:
+            start = datetime.strptime(period["start"], "%Y-%m-%d").date()
+            end = datetime.strptime(period["end"], "%Y-%m-%d").date()
+        except (KeyError, TypeError, ValueError):
+            continue
+        if start <= date <= end:
+            return period
+    return None
+
+
+def is_global_rest_day(date) -> bool:
+    return get_global_rest_period(date) is not None
+
+
+def should_publish_automatic_report(date) -> bool:
+    """참여일이면서 전체 휴식이 아닌 날짜만 자동 출석 보고."""
+    return is_challenge_day(date) and not is_global_rest_day(date)
+
+
+def _period_touches_settled_week(start, end) -> bool:
+    """이미 확정된 벌금 주차를 건드리는 기간인지 확인."""
+    d = start
+    while d <= end:
+        if store.has_week_fines(store.week_monday(d)):
+            return True
+        d += timedelta(days=1)
+    return False
+
+
+def _format_date_range(start, end) -> str:
+    if start == end:
+        return f"{start.year}-{start.month:02d}-{start.day:02d}"
+    return (
+        f"{start.year}-{start.month:02d}-{start.day:02d}"
+        f" ~ {end.year}-{end.month:02d}-{end.day:02d}"
+    )
+
+
+def _parse_iso_date(value: str):
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return None
+
+
+def _can_manage_challenge(interaction: discord.Interaction) -> bool:
+    permissions = getattr(interaction.user, "guild_permissions", None)
+    return bool(permissions and permissions.manage_guild)
 
 
 def get_day_range(date):
@@ -332,6 +387,9 @@ async def check_attendance(guild: discord.Guild, date=None) -> dict:
         date = get_challenge_date()
     channels = get_participant_channels(guild)
 
+    if is_global_rest_day(date):
+        return {get_member_name_from_channel(ch): "전체휴식" for ch in channels}
+
     # 휴식 면제 날짜 수집
     rest_exempt = await get_rest_exempt_dates(guild, cfg.get("rest_channel"), date)
 
@@ -390,7 +448,7 @@ async def record_daily_snapshot(guild: discord.Guild, date):
     이미 기록된 날짜는 절대 다시 쓰지 않아요 (기록 동결 —
     나중에 이미지를 지웠다 다시 올려도 과거 판정이 바뀌지 않도록).
     """
-    if store.has_snapshot(date):
+    if not is_challenge_day(date) or is_global_rest_day(date) or store.has_snapshot(date):
         return
 
     rest_exempt = await get_rest_exempt_dates(guild, cfg.get("rest_channel"), date)
@@ -460,8 +518,23 @@ def build_report(date, attendance: dict, is_rest_day: bool) -> discord.Embed:
     return embed
 
 
+def build_global_rest_report(date, period: dict) -> discord.Embed:
+    """수동 출석 조회용 전체 휴식 안내."""
+    weekday_names = ["월", "화", "수", "목", "금", "토", "일"]
+    day_str = f"{date.month}/{date.day}({weekday_names[date.weekday()]})"
+    reason = period.get("reason") or "전체 휴식"
+    embed = discord.Embed(
+        title=f"{GLOBAL_REST_EMOJI} {day_str} — 전체 휴식일이에요!",
+        description=f"**{reason}** 기간으로 출석 확인과 벌금 계산에서 제외됩니다.",
+        color=0x95a5a6,
+    )
+    embed.set_footer(text=f"{cfg.get('challenge_topic')} 챌린지 봇")
+    return embed
+
+
 def judge_member_week(week_dates: list, judge_counts: dict, member_rest_dates: list,
-                      preupload_exempt: list, overrides: dict = None) -> dict:
+                      preupload_exempt: list, overrides: dict = None,
+                      global_rest_dates: set = None) -> dict:
     """
     한 참여자의 주간 판정 로직. { date: 상태 } 반환.
 
@@ -484,11 +557,18 @@ def judge_member_week(week_dates: list, judge_counts: dict, member_rest_dates: l
     challenge_days = cfg.get("challenge_days")
     if overrides is None:
         overrides = {}
+    if global_rest_dates is None:
+        global_rest_dates = set()
 
     status = {}
     skip_next = False
 
     for i, d in enumerate(week_dates):
+        if d in global_rest_dates:
+            # 전체 휴식은 수동 보정보다 우선하며 출석·벌금 판정에서 완전히 제외해요.
+            status[d] = "전체휴식"
+            skip_next = False
+            continue
         if d in overrides:
             # 수동 보정 최우선
             status[d] = overrides[d]
@@ -516,7 +596,12 @@ def judge_member_week(week_dates: list, judge_counts: dict, member_rest_dates: l
                 next_challenge_d = week_dates[i + 1]
                 next_calendar_d = d + timedelta(days=1)
 
-                if next_challenge_d in member_rest_dates or next_challenge_d in preupload_exempt:
+                if next_challenge_d in global_rest_dates:
+                    # 전체 휴식 뒤의 첫 참여일 업로드가 며칠 전 결석을 살리지 않도록
+                    # 바로 다음 캘린더 날짜의 업로드만 전날 지각으로 인정해요.
+                    next_count = judge_counts.get(next_challenge_d, 0)
+                    status[d] = "지각" if next_challenge_d == next_calendar_d and next_count >= 1 else "결석"
+                elif next_challenge_d in member_rest_dates or next_challenge_d in preupload_exempt:
                     # 다음 챌린지일이 휴식/선업로드 면제일이어도
                     # 그날 1장 이상 올렸으면 전날 지각으로 인정해요
                     next_count = judge_counts.get(next_challenge_d, 0)
@@ -578,6 +663,7 @@ async def calc_weekly_result(guild: discord.Guild, ref_date=None):
     rest_channel_name = cfg.get("rest_channel")
 
     week_dates = get_week_dates(today)
+    global_rest_dates = {d for d in week_dates if is_global_rest_day(d)}
 
     # 휴식 면제 날짜 수집 (조회 주 기준)
     rest_exempt = await get_rest_exempt_dates(
@@ -604,7 +690,10 @@ async def calc_weekly_result(guild: discord.Guild, ref_date=None):
             ov = store.get_override(d, name)
             if ov is not None:
                 overrides[d] = ov
-        status = judge_member_week(week_dates, judge_counts, member_rest_dates, preupload_exempt, overrides)
+        status = judge_member_week(
+            week_dates, judge_counts, member_rest_dates, preupload_exempt,
+            overrides, global_rest_dates,
+        )
 
         results[name] = status
 
@@ -621,7 +710,10 @@ def build_weekly_report(results: dict, week_dates: list) -> discord.Embed:
     fine_late   = cfg.get("fine_late")
     fine_absent = cfg.get("fine_absent")
     weekday_names = ["월", "화", "수", "목", "금", "토", "일"]
-    STATUS_EMOJI  = {"정상": "✅", "지각": "⏰", "결석": "❌", "휴식": "💤", "선업로드": "✨"}
+    STATUS_EMOJI  = {
+        "정상": "✅", "지각": "⏰", "결석": "❌", "휴식": "💤",
+        "선업로드": "✨", "전체휴식": GLOBAL_REST_EMOJI,
+    }
 
     start_str = f"{week_dates[0].month}/{week_dates[0].day}"
     end_str   = f"{week_dates[-1].month}/{week_dates[-1].day}"
@@ -631,6 +723,19 @@ def build_weekly_report(results: dict, week_dates: list) -> discord.Embed:
         title=f"📊 주간 {topic} 챌린지 정산 ({start_str}~{end_str})",
         color=0x9b59b6,
     )
+
+    rest_period_lines = []
+    seen_period_ids = set()
+    for d in week_dates:
+        period = get_global_rest_period(d)
+        if period is None or period.get("id") in seen_period_ids:
+            continue
+        seen_period_ids.add(period.get("id"))
+        rest_period_lines.append(
+            f"{GLOBAL_REST_EMOJI} {period['start']} ~ {period['end']} · {period.get('reason') or '전체 휴식'}"
+        )
+    if rest_period_lines:
+        embed.description = "\n".join(rest_period_lines)
 
     fine_lines = []
     all_perfect = True
@@ -794,6 +899,13 @@ async def post_attendance_report(guild: discord.Guild, date=None, interaction: d
     if date is None:
         date = get_challenge_date()
 
+    global_rest = get_global_rest_period(date)
+    if global_rest is not None:
+        # 자동 보고는 조용히 생략하고, 수동 조회에만 전체 휴식 안내를 보여줘요.
+        if interaction:
+            await interaction.followup.send(embed=build_global_rest_report(date, global_rest))
+        return
+
     rest_day   = not is_challenge_day(date)
     attendance = {} if rest_day else await check_attendance(guild, date)
     embed      = build_report(date, attendance, rest_day)
@@ -826,8 +938,12 @@ async def auto_report_task():
     """매일 AUTO_REPORT_HOUR:AUTO_REPORT_MINUTE에 '완전히 끝난 하루'의 출석 결과 발표."""
     now = datetime.now(TZ)
     if now.hour == cfg.get("auto_report_hour") and now.minute == cfg.get("auto_report_minute"):
+        report_date = get_last_finished_date(now)
+        # 주말 등 비참여일과 전체 휴식일에는 자동 메시지를 보내지 않아요.
+        if not should_publish_automatic_report(report_date):
+            return
         for guild in bot.guilds:
-            await post_attendance_report(guild, date=get_last_finished_date(now))
+            await post_attendance_report(guild, date=report_date)
 
 
 @tasks.loop(minutes=1)
@@ -844,7 +960,7 @@ async def snapshot_task():
         return  # 어제 하루가 아직 안 끝났어요
 
     date = get_last_finished_date(now)
-    if store.has_snapshot(date):
+    if not is_challenge_day(date) or is_global_rest_day(date) or store.has_snapshot(date):
         return
     for guild in bot.guilds:
         await record_daily_snapshot(guild, date)
@@ -858,7 +974,7 @@ async def midnight_reminder_task():
         return
 
     date = get_challenge_date(now)
-    if not is_challenge_day(date):
+    if not is_challenge_day(date) or is_global_rest_day(date):
         return
 
     for guild in bot.guilds:
@@ -987,6 +1103,14 @@ async def slash_absent_reminder(interaction: discord.Interaction):
     if not is_challenge_day(date):
         await interaction.followup.send("❗ 오늘은 챌린지 휴식일이에요.", ephemeral=True)
         return
+    global_rest = get_global_rest_period(date)
+    if global_rest is not None:
+        await interaction.followup.send(
+            f"{GLOBAL_REST_EMOJI} 오늘은 **{global_rest.get('reason') or '전체 휴식'}** 기간이라 "
+            "미참여 알림을 보내지 않아요.",
+            ephemeral=True,
+        )
+        return
 
     ch = await get_attendance_channel(interaction.guild)
     if ch is None:
@@ -1072,11 +1196,161 @@ async def slash_config_view(interaction: discord.Interaction):
     embed.add_field(name="지각 벌금",      value=f"{cfg.get('fine_late'):,}원", inline=True)
     embed.add_field(name="결석 벌금",      value=f"{cfg.get('fine_absent'):,}원", inline=True)
     embed.add_field(name="타임존",         value=config.TIMEZONE, inline=True)
+    periods = cfg.get("global_rest_periods") or []
+    if periods:
+        period_lines = [
+            f"`#{p.get('id')}` {GLOBAL_REST_EMOJI} {p.get('start')} ~ {p.get('end')} · {p.get('reason') or '전체 휴식'}"
+            for p in periods[-5:]
+        ]
+        embed.add_field(name="전체 휴식 기간", value="\n".join(period_lines), inline=False)
     embed.set_footer(text=(
         "/설정변경출석채널 | /설정변경정산채널 | /설정변경벌금채널 | /설정변경휴식채널 | /설정변경발표시각 | /설정변경주제 | /설정변경기준시각 | /설정변경참여일 | /설정변경접두사 | /설정변경지각비 | /설정변경결석비\n"
+        f"{GLOBAL_REST_EMOJI} /전체휴식등록 /전체휴식목록 /전체휴식취소 | "
         "💸 /벌금현황 /벌금납부 /벌금내역 /벌금수정 /벌금수정취소 /벌금취소 /벌금정산 | ✏️ /출석수정 /출석수정취소"
     ))
     await interaction.response.send_message(embed=embed)
+
+
+# =====================================================
+# 슬래시 커맨드 — 전체 휴식 기간
+# =====================================================
+
+@bot.tree.command(name="전체휴식등록", description="전체 참여자의 출석과 벌금을 면제할 기간을 등록합니다.")
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.guild_only()
+@app_commands.describe(
+    시작일="시작 날짜 (YYYY-MM-DD)",
+    종료일="종료 날짜 (YYYY-MM-DD)",
+    사유="휴식 사유 (예: 추석 연휴)",
+)
+async def slash_global_rest_add(
+    interaction: discord.Interaction, 시작일: str, 종료일: str, 사유: str
+):
+    if not _can_manage_challenge(interaction):
+        await interaction.response.send_message("❗ 서버 관리 권한이 있는 멤버만 등록할 수 있어요.", ephemeral=True)
+        return
+
+    start = _parse_iso_date(시작일)
+    end = _parse_iso_date(종료일)
+    if start is None or end is None:
+        await interaction.response.send_message(
+            "❗ 날짜는 `YYYY-MM-DD` 형식으로 입력해주세요.", ephemeral=True
+        )
+        return
+    if end < start:
+        await interaction.response.send_message("❗ 종료일이 시작일보다 빠를 수 없어요.", ephemeral=True)
+        return
+    span = (end - start).days + 1
+    if span > MAX_GLOBAL_REST_RANGE_DAYS:
+        await interaction.response.send_message(
+            f"❗ 한 번에 등록할 수 있는 전체 휴식은 최대 {MAX_GLOBAL_REST_RANGE_DAYS}일이에요.",
+            ephemeral=True,
+        )
+        return
+
+    reason = (사유 or "").strip()
+    if not reason:
+        await interaction.response.send_message("❗ 휴식 사유를 입력해주세요.", ephemeral=True)
+        return
+    if len(reason) > 100:
+        await interaction.response.send_message("❗ 휴식 사유는 100자 이내로 입력해주세요.", ephemeral=True)
+        return
+    if _period_touches_settled_week(start, end):
+        await interaction.response.send_message(
+            "❗ 이미 벌금 정산이 끝난 주가 포함돼 있어 등록할 수 없어요. "
+            "확정된 벌금이 자동으로 바뀌는 것을 막기 위한 제한이에요.",
+            ephemeral=True,
+        )
+        return
+
+    periods = list(cfg.get("global_rest_periods") or [])
+    for period in periods:
+        old_start = _parse_iso_date(period.get("start"))
+        old_end = _parse_iso_date(period.get("end"))
+        if old_start is not None and old_end is not None and start <= old_end and old_start <= end:
+            await interaction.response.send_message(
+                f"❗ `#{period.get('id')}` 전체 휴식 기간({period.get('start')} ~ {period.get('end')})과 겹쳐요.",
+                ephemeral=True,
+            )
+            return
+
+    period_ids = [p.get("id", 0) for p in periods if isinstance(p.get("id", 0), int)]
+    period_id = max(period_ids, default=0) + 1
+    periods.append({
+        "id": period_id,
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "reason": reason,
+    })
+    periods.sort(key=lambda p: (p.get("start", ""), p.get("id", 0)))
+    cfg.set_and_save("global_rest_periods", periods)
+
+    await interaction.response.send_message(
+        f"{GLOBAL_REST_EMOJI} **전체 휴식 등록 완료** (`#{period_id}`)\n"
+        f"기간: **{_format_date_range(start, end)}**\n"
+        f"사유: **{reason}**\n"
+        "이 기간에는 자동 출석 보고·미참여 알림·벌금 계산을 건너뜁니다."
+    )
+
+
+@bot.tree.command(name="전체휴식목록", description="등록된 전체 휴식 기간을 확인합니다.")
+async def slash_global_rest_list(interaction: discord.Interaction):
+    periods = cfg.get("global_rest_periods") or []
+    if not periods:
+        await interaction.response.send_message("등록된 전체 휴식 기간이 없어요.", ephemeral=True)
+        return
+
+    today = get_challenge_date()
+    lines = []
+    for period in periods:
+        start = _parse_iso_date(period.get("start"))
+        end = _parse_iso_date(period.get("end"))
+        if start is None or end is None:
+            continue
+        state = "진행 중" if start <= today <= end else ("예정" if today < start else "종료")
+        lines.append(
+            f"`#{period.get('id')}` {GLOBAL_REST_EMOJI} **{_format_date_range(start, end)}** "
+            f"· {period.get('reason') or '전체 휴식'} · {state}"
+        )
+
+    embed = discord.Embed(
+        title=f"{GLOBAL_REST_EMOJI} 전체 휴식 기간",
+        description="\n".join(lines) if lines else "유효한 전체 휴식 기간이 없어요.",
+        color=0x95a5a6,
+    )
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="전체휴식취소", description="등록된 전체 휴식 기간을 취소합니다.")
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.guild_only()
+@app_commands.describe(번호="/전체휴식목록에 표시되는 번호")
+async def slash_global_rest_remove(interaction: discord.Interaction, 번호: int):
+    if not _can_manage_challenge(interaction):
+        await interaction.response.send_message("❗ 서버 관리 권한이 있는 멤버만 취소할 수 있어요.", ephemeral=True)
+        return
+
+    periods = list(cfg.get("global_rest_periods") or [])
+    target = next((p for p in periods if p.get("id") == 번호), None)
+    if target is None:
+        await interaction.response.send_message(f"❗ `#{번호}` 전체 휴식 기간을 찾을 수 없어요.", ephemeral=True)
+        return
+
+    start = _parse_iso_date(target.get("start"))
+    end = _parse_iso_date(target.get("end"))
+    if start is not None and end is not None and _period_touches_settled_week(start, end):
+        await interaction.response.send_message(
+            "❗ 이미 벌금 정산이 끝난 주가 포함돼 있어 취소할 수 없어요. "
+            "확정된 벌금이 자동으로 바뀌는 것을 막기 위한 제한이에요.",
+            ephemeral=True,
+        )
+        return
+
+    cfg.set_and_save("global_rest_periods", [p for p in periods if p.get("id") != 번호])
+    await interaction.response.send_message(
+        f"↩️ `#{번호}` 전체 휴식 기간을 취소했어요.\n"
+        f"{target.get('start')} ~ {target.get('end')} · {target.get('reason') or '전체 휴식'}"
+    )
 
 
 # =====================================================
@@ -1519,8 +1793,10 @@ async def _judge_member_week_now(guild: discord.Guild, name: str, monday):
         if ov is not None:
             overrides[d] = ov
 
+    global_rest_dates = {d for d in week_dates if is_global_rest_day(d)}
     return judge_member_week(
-        week_dates, judge_counts, rest_exempt.get(name, []), scan["preupload_exempt"], overrides
+        week_dates, judge_counts, rest_exempt.get(name, []), scan["preupload_exempt"],
+        overrides, global_rest_dates,
     )
 
 
@@ -1667,6 +1943,14 @@ async def _apply_attendance_override(interaction: discord.Interaction, 멤버: d
     if date.weekday() not in cfg.get("challenge_days"):
         await interaction.followup.send("❗ 해당 날짜는 챌린지 요일이 아니에요.", ephemeral=True)
         return
+    global_rest = get_global_rest_period(date)
+    if global_rest is not None:
+        await interaction.followup.send(
+            f"{GLOBAL_REST_EMOJI} 해당 날짜는 **{global_rest.get('reason') or '전체 휴식'}** 기간이라 "
+            "출석 보정 대상이 아니에요.",
+            ephemeral=True,
+        )
+        return
     today = get_challenge_date()
     if date > today:
         await interaction.followup.send("❗ 아직 지나지 않은 날짜는 보정할 수 없어요.", ephemeral=True)
@@ -1698,14 +1982,21 @@ async def _apply_attendance_override(interaction: discord.Interaction, 멤버: d
         if ov is not None:
             base_overrides[d] = ov
 
-    old_status_map = judge_member_week(week_dates, judge_counts, member_rest_dates, scan["preupload_exempt"], base_overrides)
+    global_rest_dates = {d for d in week_dates if is_global_rest_day(d)}
+    old_status_map = judge_member_week(
+        week_dates, judge_counts, member_rest_dates, scan["preupload_exempt"],
+        base_overrides, global_rest_dates,
+    )
 
     new_overrides = dict(base_overrides)
     if new_status is None:
         new_overrides.pop(date, None)
     else:
         new_overrides[date] = new_status
-    new_status_map = judge_member_week(week_dates, judge_counts, member_rest_dates, scan["preupload_exempt"], new_overrides)
+    new_status_map = judge_member_week(
+        week_dates, judge_counts, member_rest_dates, scan["preupload_exempt"],
+        new_overrides, global_rest_dates,
+    )
 
     # 저장
     if new_status is None:

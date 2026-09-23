@@ -22,6 +22,7 @@ DEFAULT_SETTINGS = {
     "auto_report_minute": config.AUTO_REPORT_MINUTE,
     "rest_channel": "휴식",  # 개인사정 휴식 신청 채널 이름
     "fine_channel": "정산",  # 벌금 현황을 올릴 채널 (비어있으면 주간 정산 채널 사용)
+    "global_rest_periods": [],  # [{"id", "start", "end", "reason"}] 전체 휴식 기간
 }
 
 def load() -> dict:
