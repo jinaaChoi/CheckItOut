@@ -35,9 +35,10 @@ def _save(path: str, data: dict):
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         os.replace(tmp, path)
+        return True
     except Exception:
         # 저장 실패로 봇이 죽지 않도록 무시 (다음 저장 때 재시도됨)
-        pass
+        return False
 
 
 def _iso(d) -> str:
@@ -63,6 +64,69 @@ _attendance = _load(ATTENDANCE_LOG_FILE)
 _fines = _load(FINES_FILE)
 _overrides = _load(OVERRIDES_FILE)
 _meta = _load(META_FILE)
+
+
+# =====================================================
+# 참여자 이름 변경
+# =====================================================
+
+def get_member_rename_conflicts(old_name: str, new_name: str) -> list:
+    """두 이름에 서로 다른 기록이 같은 날짜/주차에 있으면 충돌 목록 반환."""
+    if old_name == new_name:
+        return []
+
+    conflicts = []
+    datasets = (
+        ("출석", _attendance),
+        ("벌금", _fines),
+        ("출석보정", _overrides),
+    )
+    for label, data in datasets:
+        for key, members in data.items():
+            if not isinstance(members, dict):
+                continue
+            if old_name in members and new_name in members and members[old_name] != members[new_name]:
+                conflicts.append(f"{label}:{key}")
+    return conflicts
+
+
+def rename_member(old_name: str, new_name: str) -> dict:
+    """
+    참여자 이름을 출석 스냅샷·벌금 원장·수동 보정 전체에서 변경.
+
+    같은 날짜/주차에 서로 다른 두 기록이 있으면 아무것도 변경하지 않고
+    conflicts를 반환해 운영자가 먼저 확인할 수 있게 해요.
+    """
+    if old_name == new_name:
+        return {"renamed": True, "moved": {}, "conflicts": []}
+
+    conflicts = get_member_rename_conflicts(old_name, new_name)
+    if conflicts:
+        return {"renamed": False, "moved": {}, "conflicts": conflicts}
+
+    moved = {"attendance": 0, "fines": 0, "overrides": 0}
+    datasets = (
+        ("attendance", ATTENDANCE_LOG_FILE, _attendance),
+        ("fines", FINES_FILE, _fines),
+        ("overrides", OVERRIDES_FILE, _overrides),
+    )
+    for label, path, data in datasets:
+        for members in data.values():
+            if not isinstance(members, dict) or old_name not in members:
+                continue
+            if new_name not in members:
+                members[new_name] = members[old_name]
+            del members[old_name]
+            moved[label] += 1
+        if moved[label] and not _save(path, data):
+            return {
+                "renamed": False,
+                "moved": moved,
+                "conflicts": [],
+                "save_error": path,
+            }
+
+    return {"renamed": True, "moved": moved, "conflicts": []}
 
 
 # =====================================================

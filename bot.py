@@ -144,10 +144,86 @@ def get_participant_name(member: discord.Member):
     """discord.Member → 참여자 이름 (channel_members 역매핑). 미등록이면 None."""
     prefix = cfg.get("channel_prefix")
     channel_members: dict = cfg.get("channel_members")
+    fallback = None
     for ch_name, uid in channel_members.items():
         if uid == member.id:
-            return ch_name[len(prefix):]
-    return None
+            name = ch_name[len(prefix):] if ch_name.startswith(prefix) else ch_name
+            fallback = name
+            # 채널 이름 변경 전/후 연결이 동시에 남아 있으면 실제 존재하는 채널을 우선해요.
+            if discord.utils.get(member.guild.text_channels, name=ch_name) is not None:
+                return name
+    return fallback
+
+
+def sync_member_registration(channel_members: dict, channel_name: str, user_id: int) -> dict:
+    """
+    현재 채널-멤버 연결로 갱신하면서 같은 Discord 사용자 ID의 과거 이름 기록도 이전.
+    반환: {"ok", "channel_members", "old_names", "moved", "conflicts", "error"}
+    """
+    prefix = cfg.get("channel_prefix")
+    new_name = channel_name[len(prefix):] if channel_name.startswith(prefix) else channel_name
+    updated = dict(channel_members)
+
+    existing_uid = updated.get(channel_name)
+    if existing_uid is not None and existing_uid != user_id:
+        return {
+            "ok": False,
+            "channel_members": channel_members,
+            "error": "이 채널은 다른 멤버와 연결되어 있어요. 먼저 `/참여자해제`를 실행해주세요.",
+            "conflicts": [],
+        }
+
+    old_channels = [
+        ch_name for ch_name, uid in updated.items()
+        if uid == user_id and ch_name != channel_name
+    ]
+    old_names = []
+    for old_channel in old_channels:
+        old_name = old_channel[len(prefix):] if old_channel.startswith(prefix) else old_channel
+        if old_name != new_name and old_name not in old_names:
+            old_names.append(old_name)
+
+    # 여러 번 이름을 바꿔 과거 별칭이 둘 이상 남은 경우에도 먼저 모든 조합을
+    # 검사해, 일부만 이전된 뒤 뒤늦게 충돌하는 상황을 막아요.
+    conflicts = []
+    merge_names = old_names + [new_name]
+    for i, left_name in enumerate(merge_names):
+        for right_name in merge_names[i + 1:]:
+            conflicts.extend(store.get_member_rename_conflicts(left_name, right_name))
+    conflicts = list(dict.fromkeys(conflicts))
+    if conflicts:
+        return {
+            "ok": False,
+            "channel_members": channel_members,
+            "old_names": old_names,
+            "conflicts": conflicts,
+            "error": "과거 이름과 새 이름에 서로 다른 기록이 같은 날짜/주차에 있어 자동으로 합칠 수 없어요.",
+        }
+
+    moved = {"attendance": 0, "fines": 0, "overrides": 0}
+    for old_name in old_names:
+        result = store.rename_member(old_name, new_name)
+        if not result.get("renamed"):
+            return {
+                "ok": False,
+                "channel_members": channel_members,
+                "old_names": old_names,
+                "conflicts": result.get("conflicts", []),
+                "error": f"기록 저장에 실패했어요: {result.get('save_error') or '알 수 없는 오류'}",
+            }
+        for key, count in result.get("moved", {}).items():
+            moved[key] += count
+
+    for old_channel in old_channels:
+        updated.pop(old_channel, None)
+    updated[channel_name] = user_id
+    return {
+        "ok": True,
+        "channel_members": updated,
+        "old_names": old_names,
+        "moved": moved,
+        "conflicts": [],
+    }
 
 
 def get_week_dates(ref_date) -> list:
@@ -248,7 +324,8 @@ async def get_rest_exempt_dates(guild: discord.Guild, channel_name: str, ref_dat
     prefix = cfg.get("channel_prefix")
     for ch_name, uid in channel_members.items():
         member_name = ch_name[len(prefix):]
-        id_to_name[uid] = member_name
+        if uid not in id_to_name or discord.utils.get(guild.text_channels, name=ch_name) is not None:
+            id_to_name[uid] = member_name
 
     exempt = {}
     try:
@@ -1503,10 +1580,23 @@ async def slash_register(interaction: discord.Interaction, 채널: discord.TextC
     if not 채널.name.startswith(prefix):
         await interaction.response.send_message(f"❗ `{prefix}` 로 시작하는 채널만 등록할 수 있어요.", ephemeral=True)
         return
-    channel_members: dict = cfg.get("channel_members")
-    channel_members[채널.name] = 멤버.id
-    cfg.set_and_save("channel_members", channel_members)
-    await interaction.response.send_message(f"✅ **#{채널.name}** → {멤버.mention} 연결 완료!\n이제 자정 알림에서 정확히 멘션돼요.")
+    result = sync_member_registration(cfg.get("channel_members"), 채널.name, 멤버.id)
+    if not result["ok"]:
+        detail = ""
+        if result.get("conflicts"):
+            detail = "\n충돌 기록: " + ", ".join(result["conflicts"][:5])
+        await interaction.response.send_message(f"❗ {result['error']}{detail}", ephemeral=True)
+        return
+
+    cfg.set_and_save("channel_members", result["channel_members"])
+    msg = f"✅ **#{채널.name}** → {멤버.mention} 연결 완료!\n이제 자정 알림에서 정확히 멘션돼요."
+    if result.get("old_names"):
+        moved = result["moved"]
+        msg += (
+            f"\n\n🔄 과거 이름 **{', '.join(result['old_names'])}** 기록을 **{get_member_name_from_channel(채널)}**(으)로 이전했어요."
+            f"\n출석 {moved['attendance']}일 · 벌금 {moved['fines']}주 · 보정 {moved['overrides']}일"
+        )
+    await interaction.response.send_message(msg)
 
 
 @bot.tree.command(name="참여자일괄등록", description="접두사로 시작하는 채널을 스캔해서 닉네임이 일치하는 멤버를 자동으로 연결합니다.")
@@ -1525,8 +1615,13 @@ async def slash_register_all(interaction: discord.Interaction):
             interaction.guild.members
         )
         if member:
-            channel_members[ch.name] = member.id
-            success_lines.append(f"✅ #{ch.name} → {member.mention}")
+            result = sync_member_registration(channel_members, ch.name, member.id)
+            if result["ok"]:
+                channel_members = result["channel_members"]
+                migrated = f" (이름 이전: {', '.join(result['old_names'])})" if result.get("old_names") else ""
+                success_lines.append(f"✅ #{ch.name} → {member.mention}{migrated}")
+            else:
+                fail_lines.append(f"❌ #{ch.name} — {result['error']}")
         else:
             fail_lines.append(f"❌ #{ch.name}")
 
