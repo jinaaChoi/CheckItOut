@@ -13,6 +13,7 @@ DEFAULT_SETTINGS = {
     "day_start_hour": config.DAY_START_HOUR,
     "challenge_days": config.CHALLENGE_DAYS,
     "channel_members": {},  # { "크로키-진아": 123456789 (user_id) }
+    "participant_start_dates": {},  # { "discord_user_id": "YYYY-MM-DD" }
     "channel_prefix": config.CHANNEL_PREFIX,
     "challenge_topic": "크로키",  # 챌린지 주제 이름 (출석/정산 메시지에 표시)
     "fine_late": 1000,    # 지각 벌금 (원)

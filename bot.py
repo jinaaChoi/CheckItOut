@@ -118,6 +118,27 @@ def get_member_name_from_channel(channel: discord.TextChannel) -> str:
     return channel.name[len(prefix):]
 
 
+def get_participant_start_date(channel: discord.TextChannel):
+    """참여 시작일. 저장값이 없으면 개인 채널 생성일로 안전하게 추정."""
+    channel_members: dict = cfg.get("channel_members") or {}
+    start_dates: dict = cfg.get("participant_start_dates") or {}
+    user_id = channel_members.get(channel.name)
+    if user_id is not None:
+        saved = _parse_iso_date(start_dates.get(str(user_id)))
+        if saved is not None:
+            return saved
+
+    created_at = getattr(channel, "created_at", None)
+    if created_at is not None:
+        return created_at.astimezone(TZ).date()
+    return None
+
+
+def is_participant_active_on(channel: discord.TextChannel, target_date) -> bool:
+    start_date = get_participant_start_date(channel)
+    return start_date is None or target_date >= start_date
+
+
 async def get_attendance_channel(guild: discord.Guild):
     return discord.utils.get(guild.text_channels, name=cfg.get("attendance_channel"))
 
@@ -465,13 +486,18 @@ async def check_attendance(guild: discord.Guild, date=None) -> dict:
     channels = get_participant_channels(guild)
 
     if is_global_rest_day(date):
-        return {get_member_name_from_channel(ch): "전체휴식" for ch in channels}
+        return {
+            get_member_name_from_channel(ch): "전체휴식"
+            for ch in channels if is_participant_active_on(ch, date)
+        }
 
     # 휴식 면제 날짜 수집
     rest_exempt = await get_rest_exempt_dates(guild, cfg.get("rest_channel"), date)
 
     result = {}
     for ch in channels:
+        if not is_participant_active_on(ch, date):
+            continue
         name = get_member_name_from_channel(ch)
 
         # scan_channel로 한 번에 처리
@@ -531,6 +557,8 @@ async def record_daily_snapshot(guild: discord.Guild, date):
     rest_exempt = await get_rest_exempt_dates(guild, cfg.get("rest_channel"), date)
     snapshot = {}
     for ch in get_participant_channels(guild):
+        if not is_participant_active_on(ch, date):
+            continue
         name = get_member_name_from_channel(ch)
         scan = await scan_channel(ch, [date])
         snapshot[name] = {
@@ -611,7 +639,8 @@ def build_global_rest_report(date, period: dict) -> discord.Embed:
 
 def judge_member_week(week_dates: list, judge_counts: dict, member_rest_dates: list,
                       preupload_exempt: list, overrides: dict = None,
-                      global_rest_dates: set = None) -> dict:
+                      global_rest_dates: set = None,
+                      inactive_dates: set = None) -> dict:
     """
     한 참여자의 주간 판정 로직. { date: 상태 } 반환.
 
@@ -636,11 +665,18 @@ def judge_member_week(week_dates: list, judge_counts: dict, member_rest_dates: l
         overrides = {}
     if global_rest_dates is None:
         global_rest_dates = set()
+    if inactive_dates is None:
+        inactive_dates = set()
 
     status = {}
     skip_next = False
 
     for i, d in enumerate(week_dates):
+        if d in inactive_dates:
+            # 참여 시작 전 날짜는 출석·벌금 계산에서 완전히 제외해요.
+            status[d] = "참여전"
+            skip_next = False
+            continue
         if d in global_rest_dates:
             # 전체 휴식은 수동 보정보다 우선하며 출석·벌금 판정에서 완전히 제외해요.
             status[d] = "전체휴식"
@@ -752,6 +788,11 @@ async def calc_weekly_result(guild: discord.Guild, ref_date=None):
 
     for ch in channels:
         name = get_member_name_from_channel(ch)
+        start_date = get_participant_start_date(ch)
+        inactive_dates = {
+            d for d in week_dates
+            if start_date is not None and d < start_date
+        }
 
         # 채널 히스토리 단 한 번 읽기
         scan = await scan_channel(ch, week_dates)
@@ -769,7 +810,7 @@ async def calc_weekly_result(guild: discord.Guild, ref_date=None):
                 overrides[d] = ov
         status = judge_member_week(
             week_dates, judge_counts, member_rest_dates, preupload_exempt,
-            overrides, global_rest_dates,
+            overrides, global_rest_dates, inactive_dates,
         )
 
         results[name] = status
@@ -789,7 +830,7 @@ def build_weekly_report(results: dict, week_dates: list) -> discord.Embed:
     weekday_names = ["월", "화", "수", "목", "금", "토", "일"]
     STATUS_EMOJI  = {
         "정상": "✅", "지각": "⏰", "결석": "❌", "휴식": "💤",
-        "선업로드": "✨", "전체휴식": GLOBAL_REST_EMOJI,
+        "선업로드": "✨", "전체휴식": GLOBAL_REST_EMOJI, "참여전": "➖",
     }
 
     start_str = f"{week_dates[0].month}/{week_dates[0].day}"
@@ -825,6 +866,7 @@ def build_weekly_report(results: dict, week_dates: list) -> discord.Embed:
         late_count   = sum(1 for v in status.values() if v == "지각")
         absent_count = sum(1 for v in status.values() if v == "결석")
         rest_count   = sum(1 for v in status.values() if v in ("휴식", "선업로드"))
+        inactive_count = sum(1 for v in status.values() if v == "참여전")
         total_fine   = late_count * fine_late + absent_count * fine_absent
 
         summary = []
@@ -834,6 +876,8 @@ def build_weekly_report(results: dict, week_dates: list) -> discord.Embed:
             summary.append(f"결석 {absent_count}회")
         if rest_count:
             summary.append(f"휴식/선업로드 {rest_count}회")
+        if inactive_count:
+            summary.append(f"참여 전 {inactive_count}일 제외")
 
         if not summary:
             summary_str = "개근 🎉"
@@ -1573,12 +1617,29 @@ async def slash_set_report_time(interaction: discord.Interaction, 시: int, 분:
 # 슬래시 커맨드 — 참여자 등록
 # =====================================================
 
-@bot.tree.command(name="참여자등록", description="채널과 멤버를 연결해서 자정 알림 멘션을 설정합니다.")
-@app_commands.describe(채널="참여자의 업로드 채널 (예: #크로키-진아)", 멤버="해당 채널의 참여자")
-async def slash_register(interaction: discord.Interaction, 채널: discord.TextChannel, 멤버: discord.Member):
+@bot.tree.command(name="참여자등록", description="채널·멤버·참여 시작일을 등록합니다.")
+@app_commands.describe(
+    채널="참여자의 업로드 채널 (예: #크로키-진아)",
+    멤버="해당 채널의 참여자",
+    시작일="출석 계산을 시작할 날짜 (YYYY-MM-DD, 생략 시 채널 생성일)",
+)
+async def slash_register(
+    interaction: discord.Interaction,
+    채널: discord.TextChannel,
+    멤버: discord.Member,
+    시작일: str = None,
+):
     prefix = cfg.get("channel_prefix")
     if not 채널.name.startswith(prefix):
         await interaction.response.send_message(f"❗ `{prefix}` 로 시작하는 채널만 등록할 수 있어요.", ephemeral=True)
+        return
+    parsed_start = _parse_iso_date(시작일) if 시작일 else None
+    if 시작일 and parsed_start is None:
+        await interaction.response.send_message("❗ 시작일은 `YYYY-MM-DD` 형식으로 입력해주세요.", ephemeral=True)
+        return
+    today = datetime.now(TZ).date()
+    if parsed_start is not None and parsed_start > today:
+        await interaction.response.send_message("❗ 참여 시작일은 미래 날짜로 등록할 수 없어요.", ephemeral=True)
         return
     result = sync_member_registration(cfg.get("channel_members"), 채널.name, 멤버.id)
     if not result["ok"]:
@@ -1589,7 +1650,20 @@ async def slash_register(interaction: discord.Interaction, 채널: discord.TextC
         return
 
     cfg.set_and_save("channel_members", result["channel_members"])
-    msg = f"✅ **#{채널.name}** → {멤버.mention} 연결 완료!\n이제 자정 알림에서 정확히 멘션돼요."
+    start_dates = dict(cfg.get("participant_start_dates") or {})
+    start_key = str(멤버.id)
+    if parsed_start is not None:
+        start_dates[start_key] = parsed_start.isoformat()
+    elif start_key not in start_dates:
+        inferred_start = get_participant_start_date(채널) or today
+        start_dates[start_key] = inferred_start.isoformat()
+    cfg.set_and_save("participant_start_dates", start_dates)
+
+    registered_start = start_dates[start_key]
+    msg = (
+        f"✅ **#{채널.name}** → {멤버.mention} 연결 완료!"
+        f"\n📅 출석 계산 시작일: **{registered_start}** (이전 날짜는 정산 제외)"
+    )
     if result.get("old_names"):
         moved = result["moved"]
         msg += (
@@ -1605,6 +1679,7 @@ async def slash_register_all(interaction: discord.Interaction):
 
     channels = get_participant_channels(interaction.guild)
     channel_members: dict = cfg.get("channel_members")
+    start_dates = dict(cfg.get("participant_start_dates") or {})
     success_lines = []
     fail_lines = []
 
@@ -1618,14 +1693,21 @@ async def slash_register_all(interaction: discord.Interaction):
             result = sync_member_registration(channel_members, ch.name, member.id)
             if result["ok"]:
                 channel_members = result["channel_members"]
+                start_key = str(member.id)
+                if start_key not in start_dates:
+                    inferred_start = get_participant_start_date(ch) or datetime.now(TZ).date()
+                    start_dates[start_key] = inferred_start.isoformat()
                 migrated = f" (이름 이전: {', '.join(result['old_names'])})" if result.get("old_names") else ""
-                success_lines.append(f"✅ #{ch.name} → {member.mention}{migrated}")
+                success_lines.append(
+                    f"✅ #{ch.name} → {member.mention} · {start_dates[start_key]}부터{migrated}"
+                )
             else:
                 fail_lines.append(f"❌ #{ch.name} — {result['error']}")
         else:
             fail_lines.append(f"❌ #{ch.name}")
 
     cfg.set_and_save("channel_members", channel_members)
+    cfg.set_and_save("participant_start_dates", start_dates)
 
     embed = discord.Embed(title="👥 참여자 일괄 등록 결과", color=0x2ecc71 if not fail_lines else 0xe67e22)
     if success_lines:
@@ -1643,8 +1725,13 @@ async def slash_unregister(interaction: discord.Interaction, 채널: discord.Tex
     if 채널.name not in channel_members:
         await interaction.response.send_message(f"❗ **#{채널.name}** 은 등록된 채널이 아니에요.", ephemeral=True)
         return
+    user_id = channel_members[채널.name]
     del channel_members[채널.name]
     cfg.set_and_save("channel_members", channel_members)
+    if user_id not in channel_members.values():
+        start_dates = dict(cfg.get("participant_start_dates") or {})
+        start_dates.pop(str(user_id), None)
+        cfg.set_and_save("participant_start_dates", start_dates)
     await interaction.response.send_message(f"✅ **#{채널.name}** 연결이 해제됐어요.")
 
 
